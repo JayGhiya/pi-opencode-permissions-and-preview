@@ -1,10 +1,10 @@
 /**
  * Web Search Extension
  *
- * Registers a `web_search` tool using Google Custom Search JSON API.
- * 100 free queries/day.
+ * Registers a `web_search` tool using Brave Search API.
+ * 1,000 free queries/month.
  *
- * Auth: GOOGLE_API_KEY + GOOGLE_CSE_ID from env vars or settings.
+ * Auth: BRAVE_SEARCH_API_KEY from env var or settings.
  *
  * Settings file: web-search.settings.json (3-tier loading)
  *   ~/<agent-dir>/web-search.settings.json             (global)
@@ -13,8 +13,7 @@
  *
  * Schema:
  * {
- *   "apiKey": "...",
- *   "cseId": "..."
+ *   "apiKey": "..."
  * }
  */
 
@@ -27,18 +26,17 @@ const EXTENSION = "web-search"
 
 interface WebSearchSettings {
     apiKey?: string
-    cseId?: string
 }
 
-interface SearchResultItem {
+interface BraveSearchResult {
     title?: string
-    link?: string
-    snippet?: string
+    url?: string
+    description?: string
 }
 
-interface SearchResponse {
-    items?: SearchResultItem[]
-    error?: { message?: string }
+interface BraveSearchResponse {
+    web?: { results?: BraveSearchResult[] }
+    error?: string
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -47,37 +45,38 @@ export default async function (pi: ExtensionAPI) {
     pi.registerTool({
         name: "web_search",
         label: "web_search",
-        description:
-            "Search the web using Google Custom Search. Returns the top 10 results with title, URL, and snippet.",
+        description: "Search the web using Brave Search. Returns the top 10 results with title, URL, and snippet.",
         parameters: Type.Object({
             query: Type.String({ description: "The search query" }),
         }),
 
         async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
-            const apiKey = process.env.GOOGLE_API_KEY ?? settings.apiKey
-            const cseId = process.env.GOOGLE_CSE_ID ?? settings.cseId
+            const apiKey = process.env.BRAVE_SEARCH_API_KEY ?? settings.apiKey
 
-            if (!apiKey || !cseId) {
+            if (!apiKey) {
                 return {
                     details: undefined,
                     content: [
                         {
                             type: "text" as const,
-                            text: "Web search is not configured. Set GOOGLE_API_KEY and GOOGLE_CSE_ID as environment variables, or add them to web-search.settings.json (apiKey, cseId).",
+                            text: "Web search is not configured. Set BRAVE_SEARCH_API_KEY as an environment variable, or add apiKey to web-search.settings.json.",
                         },
                     ],
                 }
             }
 
             const query = (params as { query: string }).query
-            const url = new URL("https://www.googleapis.com/customsearch/v1")
-            url.searchParams.set("key", apiKey)
-            url.searchParams.set("cx", cseId)
+            const url = new URL("https://api.search.brave.com/res/v1/web/search")
             url.searchParams.set("q", query)
-            url.searchParams.set("num", "10")
+            url.searchParams.set("count", "10")
 
             try {
                 const response = await fetch(url.toString(), {
+                    headers: {
+                        Accept: "application/json",
+                        "Accept-Encoding": "gzip",
+                        "X-Subscription-Token": apiKey,
+                    },
                     signal: signal ?? undefined,
                 })
 
@@ -88,13 +87,13 @@ export default async function (pi: ExtensionAPI) {
                         content: [
                             {
                                 type: "text" as const,
-                                text: `Google Search API error: HTTP ${response.status}\n${body}`,
+                                text: `Brave Search API error: HTTP ${response.status}\n${body}`,
                             },
                         ],
                     }
                 }
 
-                const data = (await response.json()) as SearchResponse
+                const data = (await response.json()) as BraveSearchResponse
 
                 if (data.error) {
                     return {
@@ -102,13 +101,13 @@ export default async function (pi: ExtensionAPI) {
                         content: [
                             {
                                 type: "text" as const,
-                                text: `Google Search API error: ${data.error.message ?? JSON.stringify(data.error)}`,
+                                text: `Brave Search API error: ${data.error}`,
                             },
                         ],
                     }
                 }
 
-                const items = data.items ?? []
+                const items = data.web?.results ?? []
 
                 if (items.length === 0) {
                     return {
@@ -125,8 +124,8 @@ export default async function (pi: ExtensionAPI) {
                 const text = items
                     .map((item, i) => {
                         const title = item.title ?? "(no title)"
-                        const link = item.link ?? ""
-                        const snippet = item.snippet ?? ""
+                        const link = item.url ?? ""
+                        const snippet = item.description ?? ""
                         return `${i + 1}. ${title}\n   ${link}\n   ${snippet}`
                     })
                     .join("\n\n")
@@ -150,14 +149,10 @@ export default async function (pi: ExtensionAPI) {
         },
     })
 
-    const apiKey = process.env.GOOGLE_API_KEY ?? settings.apiKey
-    const cseId = process.env.GOOGLE_CSE_ID ?? settings.cseId
-    if (!apiKey || !cseId) {
-        const missing: string[] = []
-        if (!apiKey) missing.push("GOOGLE_API_KEY")
-        if (!cseId) missing.push("GOOGLE_CSE_ID")
+    const apiKey = process.env.BRAVE_SEARCH_API_KEY ?? settings.apiKey
+    if (!apiKey) {
         const announceStartup = (ctx: ExtensionContext) => {
-            ctx.ui.setWidget(`${EXTENSION}:startup`, [`Missing: ${missing.join(", ")}`])
+            ctx.ui.setWidget(`${EXTENSION}:startup`, [`Missing: BRAVE_SEARCH_API_KEY`])
         }
         pi.on("session_start", async (_event, ctx) => announceStartup(ctx))
         pi.on("session_switch", async (_event, ctx) => announceStartup(ctx))
@@ -170,6 +165,5 @@ function mergeSettings(
 ): Partial<WebSearchSettings> {
     return {
         apiKey: override.apiKey ?? base.apiKey,
-        cseId: override.cseId ?? base.cseId,
     }
 }

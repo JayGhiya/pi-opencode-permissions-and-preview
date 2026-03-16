@@ -1,18 +1,17 @@
 # Web Search Extension
 
-Registers a `web_search` tool that searches the web using the [Google Custom Search JSON API](https://developers.google.com/custom-search/v1/overview). Returns the top 10 results with title, URL, and snippet.
+Registers a `web_search` tool that searches the web using the [Brave Search API](https://brave.com/search/api/). Returns the top 10 results with title, URL, and snippet.
 
-Free tier: 100 queries/day.
+Free tier: 1,000 queries/month.
 
 ## Configuration
 
-Requires a Google API key and Custom Search Engine ID. These can be provided via environment variables or settings.
+Requires a Brave Search API key. This can be provided via an environment variable or settings.
 
-### Environment Variables
+### Environment Variable
 
 ```sh
-export GOOGLE_API_KEY="..."
-export GOOGLE_CSE_ID="..."
+export BRAVE_SEARCH_API_KEY="..."
 ```
 
 ### Settings File
@@ -27,14 +26,13 @@ export GOOGLE_CSE_ID="..."
 
 ```json
 {
-  "apiKey": "...",
-  "cseId": "..."
+  "apiKey": "..."
 }
 ```
 
-Environment variables take precedence over settings files.
+The environment variable takes precedence over settings files.
 
 ## Behavior
 
-- If credentials are missing, the tool returns a configuration error message and a startup widget shows which keys are missing
+- If the API key is missing, the tool returns a configuration error message and a startup widget shows the missing key
 - Results are formatted as a numbered list with title, link, and snippet

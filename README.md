@@ -11,4 +11,4 @@ My [pi](https://pi.dev) setup for coding agent workflows.
 - [**mcp**](extensions/mcp/) — MCP server integration
 - [**permission**](extensions/permission/) — tool execution control with allow/deny/ask rules
 - [**rules**](extensions/rules/) — rule files injected into system prompt
-- [**web-search**](extensions/web-search/) — `web_search` tool via Google Custom Search API
+- [**web-search**](extensions/web-search/) — `web_search` tool via Brave Search API
