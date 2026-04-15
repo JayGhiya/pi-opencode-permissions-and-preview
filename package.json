@@ -9,6 +9,8 @@
         "@mariozechner/pi-tui": "^0.67.2",
         "@modelcontextprotocol/sdk": "^1.26.0",
         "@mozilla/readability": "^0.6.0",
+        "@pierre/diffs": "^1.1.15",
+        "@pierre/theme": "^0.0.29",
         "@types/diff": "^7.0.2",
         "@types/jsdom": "^28.0.0",
         "@types/turndown": "^5.0.6",
