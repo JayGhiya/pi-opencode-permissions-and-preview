@@ -7,19 +7,7 @@ A Pi package for agentic coding workflows, with a focus on stronger tool permiss
 ### Global install from git
 
 ```bash
-pi install git:github.com/JayGhiya/agentic-af
-```
-
-### Project-local install
-
-```bash
-pi install -l git:github.com/JayGhiya/agentic-af
-```
-
-### Local development install
-
-```bash
-pi install /absolute/path/to/agentic-af
+pi install git:github.com/JayGhiya/pi-opencode-permissions-and-preview
 ```
 
 ## Included extension highlight: permission
@@ -32,7 +20,7 @@ The `permission` extension adds a configurable permission layer on top of Pi too
 - session-only approvals
 - AST-aware bash permission matching
 - custom preview and review UI for `edit` and `write`
-- diff preview for overwrites and edits
+- pierre diff preview for overwrites and edits
 - full-content preview for brand-new writes
 - reject with feedback flow
 
