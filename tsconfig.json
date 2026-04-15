@@ -9,8 +9,5 @@
         "esModuleInterop": true,
         "resolveJsonModule": true
     },
-    "include": [
-        "global.d.ts",
-        "extensions/**/*.ts"
-    ]
+    "include": ["global.d.ts", "extensions/**/*.ts"]
 }

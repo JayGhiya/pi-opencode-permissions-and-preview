@@ -1,38 +1,41 @@
 {
-  "name": "agentic-af",
-  "type": "module",
-  "keywords": [
-    "pi",
-    "pi-package"
-  ],
-  "pi": {
-    "extensions": [
-      "./extensions"
+    "name": "agentic-af",
+    "keywords": [
+        "pi",
+        "pi-package"
     ],
-    "skills": [
-      "./skills"
-    ],
-    "prompts": [
-      "./prompts"
-    ],
-    "themes": [
-      "./themes"
-    ]
-  },
-  "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0",
-    "@mozilla/readability": "^0.6.0",
-    "@types/jsdom": "^28.0.0",
-    "@types/turndown": "^5.0.6",
-    "jsdom": "^28.1.0",
-    "turndown": "^7.2.2",
-    "turndown-plugin-gfm": "^1.0.2"
-  },
-  "devDependencies": {
-    "oxfmt": "^0.40.0",
-    "typescript": "^5.9.3"
-  }
+    "type": "module",
+    "dependencies": {
+        "@mariozechner/pi-tui": "^0.67.2",
+        "@modelcontextprotocol/sdk": "^1.26.0",
+        "@mozilla/readability": "^0.6.0",
+        "@types/diff": "^7.0.2",
+        "@types/jsdom": "^28.0.0",
+        "@types/turndown": "^5.0.6",
+        "diff": "^8.0.4",
+        "jsdom": "^28.1.0",
+        "tree-sitter-bash": "^0.25.1",
+        "turndown": "^7.2.2",
+        "turndown-plugin-gfm": "^1.0.2",
+        "web-tree-sitter": "^0.26.8"
+    },
+    "devDependencies": {
+        "@mariozechner/pi-coding-agent": "^0.67.2",
+        "oxfmt": "^0.40.0",
+        "typescript": "^5.9.3"
+    },
+    "pi": {
+        "extensions": [
+            "./extensions"
+        ],
+        "skills": [
+            "./skills"
+        ],
+        "prompts": [
+            "./prompts"
+        ],
+        "themes": [
+            "./themes"
+        ]
+    }
 }

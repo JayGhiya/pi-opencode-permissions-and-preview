@@ -23,71 +23,66 @@
  *   "bash(git *)"         — match tool "bash" where command matches "git *"
  *   "edit(/tmp/*)"        — match tool "edit" where path matches "/tmp/*"
  *
- * Evaluation order: deny > ask > allow > defaultMode (default: "ask")
+ * Evaluation order: deny > session approvals > ask > allow > defaultMode (default: "ask")
  *
  * Argument matching depends on the tool:
- *   bash  — matched against command string
+ *   bash  — matched against AST-extracted command text
  *   edit/write/read — matched against file path
  *   grep/find/ls — matched against path argument
  */
 
 import * as fs from "node:fs"
-import * as path from "node:path"
 
-import { parseFrontmatter, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent"
+import {
+    parseFrontmatter,
+    type ExtensionAPI,
+    type ExtensionContext,
+    type SlashCommandInfo,
+} from "@mariozechner/pi-coding-agent"
 
 import * as project from "../__lib/project.js"
+import {
+    PERMISSION_CHOICES,
+    PERMISSION_PROMPT_ALLOW_ALWAYS_FOR_SESSION,
+    PERMISSION_PROMPT_ALLOW_ONCE,
+    PERMISSION_PROMPT_REJECT,
+    PERMISSION_PROMPT_REJECT_WITH_FEEDBACK,
+    SESSION_APPROVAL_CONFIRM_APPROVE,
+    SESSION_APPROVAL_CONFIRM_BACK,
+    SESSION_APPROVAL_CONFIRM_CHOICES,
+    SESSION_APPROVAL_CONFIRM_REJECT,
+    STATUS_REJECTED,
+    type PermissionPromptChoice,
+    type SessionApprovalConfirmChoice,
+} from "./constants.js"
+import type {
+    DerivedSkillAllowState,
+    Mode,
+    ParsedRule,
+    PermissionSettings,
+    RuntimeSessionState,
+} from "./models.js"
+import { BashArity } from "./bash-arity.js"
+import { extractBashCommands } from "./bash-parser.js"
+import { resolvePermissionRejection } from "./rejection.js"
+import { showPermissionReviewDialog } from "./review-dialog.js"
+import {
+    buildEditPermissionPreview,
+    buildWritePermissionPreview,
+    type PermissionEditPreviewInput,
+    type PermissionWritePreviewInput,
+} from "./review-preview.js"
 
 const EXTENSION = "permission"
 
-type Mode = "allow" | "ask" | "deny"
+// Runtime session state keyed by the active PI session id.
+const SessionStates = new Map<string, RuntimeSessionState>()
 
-interface PermissionSettings {
-    defaultMode?: Mode
-    allow?: string[]
-    deny?: string[]
-    ask?: string[]
-    keybindings?: {
-        autoAcceptEdits?: string
-    }
-}
+type LocalSkillScope = SlashCommandInfo["sourceInfo"]["scope"]
+type LocalSkillCommandInfo = SlashCommandInfo & { source: "skill" }
 
-interface ParsedRule {
-    toolPattern: string
-    argPattern?: string
-}
+const LOCAL_SKILL_SCOPES = new Set<LocalSkillScope>(["user", "project"])
 
-interface SkillCommandInfo {
-    name: string
-    source: "skill"
-    location: "user" | "project"
-    path: string
-}
-
-interface SkillAllowSource {
-    skill: string
-    location: string
-    path: string
-    rules: string[]
-}
-
-interface DerivedSkillAllowState {
-    cacheKey: string
-    rules: string[]
-    sources: SkillAllowSource[]
-}
-
-// Runtime mode overrides (toggled by user during session, not persisted)
-const SessionModeOverrides = new Map<string, Mode>()
-
-// Status prefixes parsed by pi.nvim to resolve tool-call display status
-const STATUS_ACCEPTED = "[accepted]"
-const STATUS_REJECTED = "[rejected]"
-
-// [pi.nvim] Track tool calls approved by the user (nvim) so we can flip isError back to false
-const approvedToolCalls = new Set<string>()
-
-const LOCAL_SKILL_LOCATIONS = new Set(["user", "project", "path"])
 let cachedDerivedSkillAllowState: DerivedSkillAllowState | undefined
 
 export default function (pi: ExtensionAPI) {
@@ -106,29 +101,22 @@ export default function (pi: ExtensionAPI) {
         handler: async (_args, ctx) => toggleAutoAcceptEdits(ctx),
     })
 
-    pi.registerCommand("permission-mode", {
-        description: "Set permission mode for a tool in the current session",
-        handler: async (_args, ctx) => {
-            const tool = await ctx.ui.input("Tool name", "e.g. bash, edit")
-            if (!tool) return
-            const mode = await ctx.ui.select("Mode", ["allow", "ask", "deny"])
-            if (!mode) return
-            SessionModeOverrides.set(tool, mode as Mode)
-            ctx.ui.notify(`Permission mode for "${tool}" set to "${mode}" (current session only)`, "info")
-        },
-    })
-
     pi.registerCommand("permission-settings", {
         description: "Show resolved permission settings",
         handler: async (_args, ctx) => {
+            const sessionState = getSessionState(ctx)
             const derivedSkillAllowState = getDerivedSkillAllowState(pi)
-            const settings = mergeSkillAllowRules(loadSettings(ctx.cwd), derivedSkillAllowState.rules)
-            const overrides = Object.fromEntries(SessionModeOverrides)
+            const persistedSettings = mergeSkillAllowRules(loadSettings(ctx.cwd), derivedSkillAllowState.rules)
+            const overrides = Object.fromEntries(sessionState.modeOverrides)
+            const sessionApprovedRules = Array.from(sessionState.approvalRules)
+            const effectiveSettings = mergeSessionApprovalRules(persistedSettings, sessionApprovedRules)
             const output = JSON.stringify(
                 {
-                    settings,
+                    settings: persistedSettings,
+                    effectiveSettings,
                     derivedSkillAllowRules: derivedSkillAllowState.rules,
                     skillRuleSources: derivedSkillAllowState.sources,
+                    sessionApprovedRules,
                     sessionOverrides: overrides,
                 },
                 null,
@@ -138,24 +126,16 @@ export default function (pi: ExtensionAPI) {
         },
     })
 
-    pi.on("message_end", async (event) => {
-        const msg = event.message as unknown as Record<string, unknown>
-        // Only process tool results
-        if (msg.role !== "toolResult") return
-        if (typeof msg.toolCallId !== "string") return
-
-        // Blocked tool results come back as isError=true. Flip back for approved calls
-        // so the LLM doesn't treat accepted edits as failures.
-        if (approvedToolCalls.delete(msg.toolCallId)) {
-            msg.isError = false
-        }
+    pi.on("session_start", async (_event, ctx) => {
+        syncSessionStatus(ctx)
     })
 
     pi.on("tool_call", async (event, ctx) => {
+        const sessionState = getSessionState(ctx)
         const derivedSkillAllowState = getDerivedSkillAllowState(pi)
-        const settings = mergeSkillAllowRules(loadSettings(ctx.cwd), derivedSkillAllowState.rules)
+        const persistedSettings = mergeSkillAllowRules(loadSettings(ctx.cwd), derivedSkillAllowState.rules)
         const argValue = getMatchValue(event.toolName, event.input as Record<string, unknown>)
-        const mode = resolveMode(settings, event.toolName, argValue ?? "", ctx.cwd)
+        const mode = await resolveMode(persistedSettings, event.toolName, argValue ?? "", sessionState)
 
         switch (mode) {
             case "allow": {
@@ -178,62 +158,65 @@ export default function (pi: ExtensionAPI) {
                     }
                 }
 
-                switch (event.toolName) {
-                    case "edit":
-                    case "write": {
-                        if (!argValue) break
+                while (true) {
+                    const choice = await promptForPermission(
+                        event.toolName,
+                        event.input as Record<string, unknown>,
+                        argValue,
+                        ctx,
+                    )
 
-                        const title = JSON.stringify({
-                            prompt: `${event.toolName}: ${argValue}`,
-                            toolName: event.toolName,
-                            toolInput: event.input,
-                        })
-                        const choice = await ctx.ui.select(title, ["Accept", "Reject"])
+                    if (choice === PERMISSION_PROMPT_ALLOW_ONCE) {
+                        return undefined
+                    }
 
-                        if (choice === "Accept") {
-                            // TUI — don't block, let the tool apply the change
+                    if (choice === PERMISSION_PROMPT_ALLOW_ALWAYS_FOR_SESSION) {
+                        const sessionRules = await getSessionApprovalRules(event.toolName, argValue)
+                        const confirmation = await confirmSessionApprovalRules(ctx, event.toolName, sessionRules)
+
+                        if (confirmation === "approved") {
+                            for (const rule of sessionRules) {
+                                sessionState.approvalRules.add(rule)
+                            }
+                            ctx.ui.notify(
+                                `Added session approval rule${sessionRules.length === 1 ? "" : "s"}: ${sessionRules.join(", ")}`,
+                                "info",
+                            )
                             return undefined
-                        } else if (choice?.startsWith("{")) {
-                            const parsed = JSON.parse(choice)
-                            if (parsed.result === "Accepted") {
-                                // Nvim plugin already applied the change
-                                approvedToolCalls.add(event.toolCallId)
-                                return {
-                                    block: true,
-                                    reason: `${STATUS_ACCEPTED} User approved the edit. Changes applied to ${argValue} as proposed.`,
-                                }
-                            } else if (parsed.result === "AcceptModified") {
-                                // Nvim plugin applied user's modified version
-                                approvedToolCalls.add(event.toolCallId)
-                                return {
-                                    block: true,
-                                    reason: `${STATUS_ACCEPTED} User approved with modifications. ${argValue} was updated with user's version, which differs from what you proposed. Current content of ${argValue}:\n\`\`\`\n${parsed.content}\n\`\`\``,
-                                }
+                        }
+
+                        if (confirmation === "back") {
+                            continue
+                        }
+
+                        if (confirmation === "reject") {
+                            const rejection = await resolvePermissionRejection(
+                                ctx,
+                                PERMISSION_PROMPT_REJECT,
+                                event.toolName,
+                                argValue,
+                            )
+                            if (rejection.kind === "back") {
+                                continue
+                            }
+                            ctx.abort()
+                            return {
+                                block: true,
+                                reason: rejection.reason,
                             }
                         }
+                    }
+
+                    const rejection = await resolvePermissionRejection(ctx, choice, event.toolName, argValue)
+                    if (rejection.kind === "back") {
+                        continue
+                    }
+                    if (rejection.kind === "hard") {
                         ctx.abort()
-                        return {
-                            block: true,
-                            reason: `${STATUS_REJECTED} User rejected the edit to ${argValue}. File unchanged.`,
-                        }
                     }
-                    case "bash": {
-                        if (!argValue) return { block: true, reason: "No command provided" }
-                        const allowed = await ctx.ui.confirm("Agent wants to run shell command. Allow?", argValue)
-                        if (!allowed) {
-                            ctx.abort()
-                            return { block: true, reason: `${STATUS_REJECTED} Rejected by user` }
-                        }
-                        return undefined
-                    }
-                    default: {
-                        const message = argValue ?? JSON.stringify(event.input, null, 2)
-                        const allowed = await ctx.ui.confirm(event.toolName, message)
-                        if (!allowed) {
-                            ctx.abort()
-                            return { block: true, reason: `${STATUS_REJECTED} Rejected by user` }
-                        }
-                        return undefined
+                    return {
+                        block: true,
+                        reason: rejection.reason,
                     }
                 }
             }
@@ -258,19 +241,41 @@ function loadSettings(cwd: string) {
     return project.loadExtensionSettings<PermissionSettings>(EXTENSION, cwd, mergePermissions)
 }
 
+function getSessionState(ctx: ExtensionContext): RuntimeSessionState {
+    const sessionId = ctx.sessionManager.getSessionId()
+    const existing = SessionStates.get(sessionId)
+    if (existing) return existing
+
+    const state: RuntimeSessionState = {
+        modeOverrides: new Map<string, Mode>(),
+        approvalRules: new Set<string>(),
+    }
+    SessionStates.set(sessionId, state)
+    return state
+}
+
+function syncSessionStatus(ctx: ExtensionContext) {
+    const sessionState = getSessionState(ctx)
+    const autoAcceptEnabled =
+        sessionState.modeOverrides.get("edit") === "allow" && sessionState.modeOverrides.get("write") === "allow"
+
+    ctx.ui.setStatus("permission", autoAcceptEnabled ? "▶︎ Auto-accept edits" : undefined)
+}
+
 function toggleAutoAcceptEdits(ctx: ExtensionContext) {
-    const editCurrent = SessionModeOverrides.get("edit")
-    const writeCurrent = SessionModeOverrides.get("write")
+    const sessionState = getSessionState(ctx)
+    const editCurrent = sessionState.modeOverrides.get("edit")
+    const writeCurrent = sessionState.modeOverrides.get("write")
 
     if (editCurrent === "allow" && writeCurrent === "allow") {
-        SessionModeOverrides.delete("edit")
-        SessionModeOverrides.delete("write")
-        ctx.ui.setStatus("permission", undefined)
+        sessionState.modeOverrides.delete("edit")
+        sessionState.modeOverrides.delete("write")
     } else {
-        SessionModeOverrides.set("edit", "allow")
-        SessionModeOverrides.set("write", "allow")
-        ctx.ui.setStatus("permission", "▶︎ Auto-accept edits")
+        sessionState.modeOverrides.set("edit", "allow")
+        sessionState.modeOverrides.set("write", "allow")
     }
+
+    syncSessionStatus(ctx)
 }
 
 function parseRuleList(value: unknown): string[] {
@@ -299,10 +304,10 @@ function getSkillAllowedRules(skillPath: string): string[] {
     }
 }
 
-function buildSkillAllowCacheKey(skills: SkillCommandInfo[]): string {
+function buildSkillAllowCacheKey(skills: LocalSkillCommandInfo[]): string {
     return skills
         .map((skill) => {
-            const skillPath = skill.path ?? ""
+            const skillPath = skill.sourceInfo.path
             let stamp = "missing"
 
             if (skillPath) {
@@ -314,35 +319,34 @@ function buildSkillAllowCacheKey(skills: SkillCommandInfo[]): string {
                 }
             }
 
-            return `${skill.location ?? ""}:${skillPath}:${stamp}`
+            return `${skill.sourceInfo.scope}:${skillPath}:${stamp}`
         })
         .sort()
         .join("\n")
 }
 
+function isLocalSkillCommand(command: SlashCommandInfo): command is LocalSkillCommandInfo {
+    return command.source === "skill" && LOCAL_SKILL_SCOPES.has(command.sourceInfo.scope)
+}
+
 function getDerivedSkillAllowState(pi: ExtensionAPI): DerivedSkillAllowState {
     const skills = pi
         .getCommands()
-        .filter(
-            (command): command is SkillCommandInfo =>
-                command.source === "skill" &&
-                LOCAL_SKILL_LOCATIONS.has(command.location ?? "") &&
-                typeof command.path === "string",
-        )
-        .sort((a, b) => a.path.localeCompare(b.path))
+        .filter(isLocalSkillCommand)
+        .sort((a, b) => a.sourceInfo.path.localeCompare(b.sourceInfo.path))
 
     const cacheKey = buildSkillAllowCacheKey(skills)
-    if (cachedDerivedSkillAllowState?.cacheKey === cacheKey) {
+    if (cachedDerivedSkillAllowState && cachedDerivedSkillAllowState.cacheKey === cacheKey) {
         return cachedDerivedSkillAllowState
     }
 
     const sources = skills
         .map((skill) => {
-            const rules = getSkillAllowedRules(skill.path)
+            const rules = getSkillAllowedRules(skill.sourceInfo.path)
             return {
                 skill: skill.name.replace(/^skill:/, ""),
-                location: skill.location ?? "",
-                path: skill.path,
+                location: skill.sourceInfo.scope,
+                path: skill.sourceInfo.path,
                 rules,
             }
         })
@@ -362,6 +366,15 @@ function mergeSkillAllowRules(settings: PermissionSettings, skillRules: string[]
     return {
         ...settings,
         allow: [...new Set([...(settings.allow ?? []), ...skillRules])],
+    }
+}
+
+function mergeSessionApprovalRules(settings: PermissionSettings, sessionRules: string[]): PermissionSettings {
+    if (sessionRules.length === 0) return settings
+
+    return {
+        ...settings,
+        allow: [...new Set([...(settings.allow ?? []), ...sessionRules])],
     }
 }
 
@@ -408,11 +421,17 @@ function getMatchValue(tool: string, input: Record<string, unknown>): string | u
     }
 }
 
-function resolveSingleMode(settings: PermissionSettings, toolName: string, argValue: string): Mode {
-    const override = SessionModeOverrides.get(toolName)
+function resolveSingleMode(
+    settings: PermissionSettings,
+    toolName: string,
+    argValue: string,
+    sessionState: RuntimeSessionState,
+): Mode {
+    const override = sessionState.modeOverrides.get(toolName)
     if (override) return override
 
     if (matchesAnyRule(settings.deny ?? [], toolName, argValue)) return "deny"
+    if (matchesAnyRule(Array.from(sessionState.approvalRules), toolName, argValue)) return "allow"
     if (matchesAnyRule(settings.ask ?? [], toolName, argValue)) return "ask"
     if (matchesAnyRule(settings.allow ?? [], toolName, argValue)) return "allow"
 
@@ -421,235 +440,143 @@ function resolveSingleMode(settings: PermissionSettings, toolName: string, argVa
 
 /**
  * Resolve the permission mode for a tool call.
- * For bash commands, splits on pipes/operators and checks every segment.
- * The strictest mode wins: deny > ask > allow.
- * As an extra safety layer, otherwise-allowed bash commands that contain
- * output redirection are escalated to "ask".
+ * For bash commands, parse the full shell text with Tree-sitter, walk AST
+ * command nodes, skip cwd-only commands, and evaluate only the extracted
+ * command texts. The strictest mode wins: deny > ask > allow.
  */
-function resolveMode(settings: PermissionSettings, toolName: string, argValue: string, cwd?: string): Mode {
+async function resolveMode(
+    settings: PermissionSettings,
+    toolName: string,
+    argValue: string,
+    sessionState: RuntimeSessionState,
+): Promise<Mode> {
     if (toolName !== "bash" || !argValue) {
-        return resolveSingleMode(settings, toolName, argValue)
+        return resolveSingleMode(settings, toolName, argValue, sessionState)
     }
 
-    const normalized = cwd ? normalizeBashForPermission(argValue, cwd) : argValue
-    const segments = splitShellCommand(normalized)
+    const commands = await extractBashCommands(argValue)
+    if (commands.length === 0) return "allow"
+
     let worst: Mode = "allow"
 
-    for (const segment of segments) {
-        const mode = resolveSingleMode(settings, toolName, segment)
+    for (const command of commands) {
+        const mode = resolveSingleMode(settings, toolName, command.text, sessionState)
         if (mode === "deny") return "deny"
         if (mode === "ask") worst = "ask"
-    }
-
-    if (worst === "allow" && hasShellOutputRedirection(normalized)) {
-        return "ask"
     }
 
     return worst
 }
 
-function normalizeBashForPermission(command: string, cwd: string): string {
-    const start = skipWhitespace(command, 0)
-    if (!command.startsWith("cd", start)) return command
+async function promptForPermission(
+    toolName: string,
+    input: Record<string, unknown>,
+    argValue: string | undefined,
+    ctx: ExtensionContext,
+): Promise<PermissionPromptChoice | undefined> {
+    if (toolName === "edit") {
+        const preview = await buildEditPermissionPreview(asEditToolInput(input), ctx.cwd)
+        return showPermissionReviewDialog(ctx, preview)
+    }
 
-    const afterCd = start + 2
-    if (afterCd < command.length && !/\s/.test(command[afterCd])) return command
+    if (toolName === "write") {
+        const preview = await buildWritePermissionPreview(asWriteToolInput(input), ctx.cwd)
+        return showPermissionReviewDialog(ctx, preview)
+    }
 
-    const dirStart = skipWhitespace(command, afterCd)
-    const dirToken = readShellWord(command, dirStart)
-    if (!dirToken?.word) return command
-
-    const afterDir = skipWhitespace(command, dirToken.end)
-    if (command.slice(afterDir, afterDir + 2) !== "&&") return command
-
-    const rest = command.slice(afterDir + 2).trim()
-    if (!rest) return command
-
-    const currentDir = path.resolve(cwd)
-    const targetDir = path.resolve(cwd, dirToken.word)
-
-    return targetDir === currentDir ? rest : command
+    const title = buildPromptTitle(toolName, input, argValue)
+    const choice = await ctx.ui.select(title, [...PERMISSION_CHOICES])
+    return isPermissionPromptChoice(choice) ? choice : undefined
 }
 
-/**
- * Split a shell command on unquoted operators: |, ||, &&, ;
- * Respects single/double quotes and backslash escapes.
- */
-function splitShellCommand(command: string): string[] {
-    const segments: string[] = []
-    let current = ""
-    let inSingle = false
-    let inDouble = false
-    let escaped = false
-
-    for (let i = 0; i < command.length; i++) {
-        const char = command[i]
-
-        if (escaped) {
-            current += char
-            escaped = false
-            continue
-        }
-        if (char === "\\" && !inSingle) {
-            escaped = true
-            current += char
-            continue
-        }
-        if (char === "'" && !inDouble) {
-            inSingle = !inSingle
-            current += char
-            continue
-        }
-        if (char === '"' && !inSingle) {
-            inDouble = !inDouble
-            current += char
-            continue
-        }
-
-        if (!inSingle && !inDouble) {
-            if (char === "|" && command[i + 1] === "|") {
-                segments.push(current)
-                current = ""
-                i++
-                continue
-            }
-            if (char === "&" && command[i + 1] === "&") {
-                segments.push(current)
-                current = ""
-                i++
-                continue
-            }
-            if (char === ";") {
-                segments.push(current)
-                current = ""
-                continue
-            }
-            if (char === "|") {
-                segments.push(current)
-                current = ""
-                continue
-            }
-        }
-
-        current += char
+async function confirmSessionApprovalRules(
+    ctx: ExtensionContext,
+    toolName: string,
+    rules: string[],
+): Promise<"approved" | "back" | "reject"> {
+    if (rules.length === 0) {
+        ctx.ui.notify(`Could not derive a session approval rule for ${toolName}`, "error")
+        return "back"
     }
 
-    if (current.trim()) {
-        segments.push(current)
-    }
+    const suffix = rules.length === 1 ? "rule" : "rules"
+    const message = `Allow always for this session will add the following ${suffix}:\n\n${rules
+        .map((rule) => `- ${rule}`)
+        .join("\n")}`
 
-    return segments.map((s) => s.trim()).filter((s) => s.length > 0)
+    const choice = await ctx.ui.select(message, [...SESSION_APPROVAL_CONFIRM_CHOICES])
+    if (choice === SESSION_APPROVAL_CONFIRM_APPROVE) return "approved"
+    if (choice === SESSION_APPROVAL_CONFIRM_BACK) return "back"
+    if (choice === SESSION_APPROVAL_CONFIRM_REJECT) return "reject"
+    return "reject"
 }
 
-/**
- * Detect unquoted shell output redirections.
- * Escalates otherwise-allowed bash commands to "ask" for an extra confirmation.
- * Redirections to /dev/null are exempt.
- */
-function hasShellOutputRedirection(command: string): boolean {
-    let inSingle = false
-    let inDouble = false
-    let escaped = false
-
-    for (let i = 0; i < command.length; i++) {
-        const char = command[i]
-
-        if (escaped) {
-            escaped = false
-            continue
-        }
-        if (char === "\\" && !inSingle) {
-            escaped = true
-            continue
-        }
-        if (char === "'" && !inDouble) {
-            inSingle = !inSingle
-            continue
-        }
-        if (char === '"' && !inSingle) {
-            inDouble = !inDouble
-            continue
-        }
-
-        if (inSingle || inDouble) continue
-
-        if (char === "&" && command[i + 1] === ">") {
-            return true
-        }
-
-        if (char !== ">") continue
-
-        // Ignore fd duplication/closing like 2>&1, >&2, >&-
-        if (command[i + 1] === "&") continue
-        // Ignore process substitution like >(...)
-        if (command[i + 1] === "(") continue
-        // Ignore redirection to /dev/null (e.g. >/dev/null, 2>/dev/null, >>/dev/null)
-        {
-            let j = i + 1
-            if (j < command.length && command[j] === ">") j++ // skip >> second >
-            while (j < command.length && command[j] === " ") j++ // skip whitespace
-            if (command.startsWith("/dev/null", j)) continue
-        }
-
-        return true
-    }
-
-    return false
+function buildPromptTitle(toolName: string, input: Record<string, unknown>, argValue: string | undefined): string {
+    const details = argValue ?? JSON.stringify(input, null, 2)
+    return `${toolName}\n\n${details}\n\nChoose permission:`
 }
 
-function skipWhitespace(command: string, index: number): number {
-    while (index < command.length && /\s/.test(command[index])) index++
-    return index
+async function getSessionApprovalRules(toolName: string, argValue: string | undefined): Promise<string[]> {
+    switch (toolName) {
+        case "bash": {
+            if (!argValue) return []
+            const commands = await extractBashCommands(argValue)
+            return [
+                ...new Set(
+                    commands
+                        .map((command) => getBashAlwaysPattern(command.tokens))
+                        .filter((rule): rule is string => Boolean(rule)),
+                ),
+            ]
+        }
+        case "edit":
+        case "write":
+        case "read":
+        case "fetch":
+        case "grep":
+        case "find":
+        case "ls":
+            return [toolName]
+        default:
+            return [toolName]
+    }
 }
 
-function readShellWord(command: string, start: number): { word: string; end: number } | undefined {
-    if (start >= command.length) return undefined
+function getBashAlwaysPattern(tokens: string[]): string | undefined {
+    const prefix = BashArity.prefix(tokens)
+    if (prefix.length === 0) return undefined
+    return `bash(${prefix.join(" ")} *)`
+}
 
-    const first = command[start]
-    if (first === '"' || first === "'") {
-        const quote = first
-        let value = ""
-        let escaped = false
-
-        for (let i = start + 1; i < command.length; i++) {
-            const char = command[i]
-            if (escaped) {
-                value += char
-                escaped = false
-                continue
-            }
-            if (char === "\\" && quote === '"') {
-                escaped = true
-                continue
-            }
-            if (char === quote) {
-                return { word: value, end: i + 1 }
-            }
-            value += char
-        }
-
-        return undefined
+function asEditToolInput(input: Record<string, unknown>): PermissionEditPreviewInput {
+    return {
+        path: typeof input.path === "string" ? input.path : "",
+        edits: Array.isArray(input.edits)
+            ? input.edits
+                  .filter(
+                      (edit): edit is { oldText: string; newText: string } =>
+                          typeof edit === "object" &&
+                          edit !== null &&
+                          typeof edit.oldText === "string" &&
+                          typeof edit.newText === "string",
+                  )
+                  .map((edit) => ({ oldText: edit.oldText, newText: edit.newText }))
+            : [],
     }
+}
 
-    let value = ""
-    let escaped = false
-
-    for (let i = start; i < command.length; i++) {
-        const char = command[i]
-        if (escaped) {
-            value += char
-            escaped = false
-            continue
-        }
-        if (char === "\\") {
-            escaped = true
-            continue
-        }
-        if (/\s/.test(char) || char === "&" || char === "|" || char === ";") {
-            return value ? { word: value, end: i } : undefined
-        }
-        value += char
+function asWriteToolInput(input: Record<string, unknown>): PermissionWritePreviewInput {
+    return {
+        path: typeof input.path === "string" ? input.path : "",
+        content: typeof input.content === "string" ? input.content : "",
     }
+}
 
-    return value ? { word: value, end: command.length } : undefined
+function isPermissionPromptChoice(value: string | undefined): value is PermissionPromptChoice {
+    return (
+        value === PERMISSION_PROMPT_ALLOW_ONCE ||
+        value === PERMISSION_PROMPT_ALLOW_ALWAYS_FOR_SESSION ||
+        value === PERMISSION_PROMPT_REJECT ||
+        value === PERMISSION_PROMPT_REJECT_WITH_FEEDBACK
+    )
 }
