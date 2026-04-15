@@ -39,3 +39,9 @@ The `permission` extension adds a configurable permission layer on top of Pi too
 For `edit` and `write`, the permission prompt includes a compact preview and a larger review mode with `Ctrl+F`, plus scrolling with `PgUp` / `PgDn`.
 
 Read more in [extensions/permission/README.md](./extensions/permission/README.md).
+
+### Credits
+
+- [Opencode](https://github.com/anomalyco/opencode)
+- [pierre diffs](https://diffs.com)
+- [pi tutorial](https://github.com/earendil-works/pi-tutorial)
