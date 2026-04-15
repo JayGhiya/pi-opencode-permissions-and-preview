@@ -1,9 +1,12 @@
-import * as Diff from "diff"
+import type { FileDiffMetadata } from "@pierre/diffs"
 import { constants } from "node:fs"
 import { access, readFile } from "node:fs/promises"
 import * as os from "node:os"
 import { isAbsolute, resolve as resolvePath } from "node:path"
 
+import { loadHighlightedDiff } from "./pierre-highlight.js"
+import { buildDiffMetadata, summarizeDiffMetadata } from "./pierre-metadata.js"
+import type { HighlightedDiffSet, PermissionDiffSnapshot } from "./pierre-types.js"
 
 export interface PermissionEditPreviewInput {
     path: string
@@ -26,7 +29,10 @@ export interface PermissionDiffPreview {
     kind: "diff"
     toolName: "edit" | "write"
     path: string
-    diff: string
+    oldContent: string
+    newContent: string
+    metadata: FileDiffMetadata
+    highlighted: HighlightedDiffSet
     firstChangedLine: number | undefined
     addedLines: number
     removedLines: number
@@ -70,18 +76,13 @@ export async function buildEditPermissionPreview(
         const { text: content } = stripBom(rawContent)
         const normalizedContent = normalizeToLF(content)
         const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, input.edits, input.path)
-        const { diff, firstChangedLine } = generateDiffString(baseContent, newContent)
-        const stats = summarizeDiff(diff)
 
-        return {
-            kind: "diff",
+        return await buildPierrePermissionDiffPreview({
             toolName: "edit",
             path: input.path,
-            diff,
-            firstChangedLine,
-            addedLines: stats.addedLines,
-            removedLines: stats.removedLines,
-        }
+            oldContent: baseContent,
+            newContent,
+        })
     } catch (error) {
         return {
             kind: "error",
@@ -113,18 +114,13 @@ export async function buildWritePermissionPreview(
     try {
         const existingContent = normalizeToLF(await readFile(absolutePath, "utf-8"))
         const nextContent = normalizeToLF(input.content)
-        const { diff, firstChangedLine } = generateDiffString(existingContent, nextContent)
-        const stats = summarizeDiff(diff)
 
-        return {
-            kind: "diff",
+        return await buildPierrePermissionDiffPreview({
             toolName: "write",
             path: input.path,
-            diff,
-            firstChangedLine,
-            addedLines: stats.addedLines,
-            removedLines: stats.removedLines,
-        }
+            oldContent: existingContent,
+            newContent: nextContent,
+        })
     } catch (error) {
         return {
             kind: "error",
@@ -149,20 +145,34 @@ function countLines(text: string): number {
     return normalizeToLF(text).split("\n").length
 }
 
-function summarizeDiff(diff: string): { addedLines: number; removedLines: number } {
-    if (!diff) {
-        return { addedLines: 0, removedLines: 0 }
+async function buildPierrePermissionDiffPreview(input: {
+    toolName: "edit" | "write"
+    path: string
+    oldContent: string
+    newContent: string
+}): Promise<PermissionDiffPreview> {
+    const snapshot: PermissionDiffSnapshot = {
+        path: input.path,
+        oldContent: input.oldContent,
+        newContent: input.newContent,
     }
 
-    let addedLines = 0
-    let removedLines = 0
+    const metadata = buildDiffMetadata(snapshot)
+    const highlighted = await loadHighlightedDiff(metadata)
+    const summary = summarizeDiffMetadata(metadata)
 
-    for (const line of diff.split("\n")) {
-        if (line.startsWith("+")) addedLines += 1
-        if (line.startsWith("-")) removedLines += 1
+    return {
+        kind: "diff",
+        toolName: input.toolName,
+        path: input.path,
+        oldContent: input.oldContent,
+        newContent: input.newContent,
+        metadata,
+        highlighted,
+        firstChangedLine: summary.firstChangedLine,
+        addedLines: summary.addedLines,
+        removedLines: summary.removedLines,
     }
-
-    return { addedLines, removedLines }
 }
 
 function normalizeAtPrefix(filePath: string): string {
@@ -357,118 +367,6 @@ function applyEditsToNormalizedContent(
     }
 
     return { baseContent, newContent }
-}
-
-function generateDiffString(
-    oldContent: string,
-    newContent: string,
-    contextLines = 4,
-): { diff: string; firstChangedLine: number | undefined } {
-    const parts = Diff.diffLines(oldContent, newContent)
-    const output: string[] = []
-    const oldLines = oldContent.split("\n")
-    const newLines = newContent.split("\n")
-    const maxLineNum = Math.max(oldLines.length, newLines.length)
-    const lineNumWidth = String(maxLineNum).length
-
-    let oldLineNum = 1
-    let newLineNum = 1
-    let lastWasChange = false
-    let firstChangedLine: number | undefined
-
-    for (let index = 0; index < parts.length; index += 1) {
-        const part = parts[index]
-        const raw = part.value.split("\n")
-        if (raw[raw.length - 1] === "") raw.pop()
-
-        if (part.added || part.removed) {
-            if (firstChangedLine === undefined) {
-                firstChangedLine = newLineNum
-            }
-
-            for (const line of raw) {
-                if (part.added) {
-                    output.push(`+${String(newLineNum).padStart(lineNumWidth, " ")} ${line}`)
-                    newLineNum += 1
-                } else {
-                    output.push(`-${String(oldLineNum).padStart(lineNumWidth, " ")} ${line}`)
-                    oldLineNum += 1
-                }
-            }
-
-            lastWasChange = true
-            continue
-        }
-
-        const nextPartIsChange = index < parts.length - 1 && Boolean(parts[index + 1].added || parts[index + 1].removed)
-        const hasLeadingChange = lastWasChange
-        const hasTrailingChange = nextPartIsChange
-
-        if (hasLeadingChange && hasTrailingChange) {
-            if (raw.length <= contextLines * 2) {
-                for (const line of raw) {
-                    output.push(` ${String(oldLineNum).padStart(lineNumWidth, " ")} ${line}`)
-                    oldLineNum += 1
-                    newLineNum += 1
-                }
-            } else {
-                const leadingLines = raw.slice(0, contextLines)
-                const trailingLines = raw.slice(raw.length - contextLines)
-                const skippedLines = raw.length - leadingLines.length - trailingLines.length
-
-                for (const line of leadingLines) {
-                    output.push(` ${String(oldLineNum).padStart(lineNumWidth, " ")} ${line}`)
-                    oldLineNum += 1
-                    newLineNum += 1
-                }
-
-                output.push(` ${"".padStart(lineNumWidth, " ")} ...`)
-                oldLineNum += skippedLines
-                newLineNum += skippedLines
-
-                for (const line of trailingLines) {
-                    output.push(` ${String(oldLineNum).padStart(lineNumWidth, " ")} ${line}`)
-                    oldLineNum += 1
-                    newLineNum += 1
-                }
-            }
-        } else if (hasLeadingChange) {
-            const shownLines = raw.slice(0, contextLines)
-            const skippedLines = raw.length - shownLines.length
-
-            for (const line of shownLines) {
-                output.push(` ${String(oldLineNum).padStart(lineNumWidth, " ")} ${line}`)
-                oldLineNum += 1
-                newLineNum += 1
-            }
-
-            if (skippedLines > 0) {
-                output.push(` ${"".padStart(lineNumWidth, " ")} ...`)
-                oldLineNum += skippedLines
-                newLineNum += skippedLines
-            }
-        } else if (hasTrailingChange) {
-            const skippedLines = Math.max(0, raw.length - contextLines)
-            if (skippedLines > 0) {
-                output.push(` ${"".padStart(lineNumWidth, " ")} ...`)
-                oldLineNum += skippedLines
-                newLineNum += skippedLines
-            }
-
-            for (const line of raw.slice(skippedLines)) {
-                output.push(` ${String(oldLineNum).padStart(lineNumWidth, " ")} ${line}`)
-                oldLineNum += 1
-                newLineNum += 1
-            }
-        } else {
-            oldLineNum += raw.length
-            newLineNum += raw.length
-        }
-
-        lastWasChange = false
-    }
-
-    return { diff: output.join("\n"), firstChangedLine }
 }
 
 interface FuzzyMatchResult {

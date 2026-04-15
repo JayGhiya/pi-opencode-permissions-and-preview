@@ -104,7 +104,8 @@ Pi loads and merges 3 tiers:
 
 By default, the permission prompt shows a compact preview:
 
-- diff preview for edits and overwrites
+- Pierre-style stacked (unified) diff rows for `edit` and overwrite `write`
+- syntax-aware highlighting derived from `@pierre/diffs` metadata + highlighter output
 - concise new-file summary for brand-new writes
 - the same 4 permission outcomes as every other ask flow
 
@@ -114,7 +115,9 @@ Inside the dialog:
 
 - `Ctrl+F` toggles fullscreen review
 - `PgUp` / `PgDn` scroll the preview area
-- fullscreen for existing files shows a larger diff view
+- for existing-file diffs in fullscreen:
+  - `u` switches to stacked/unified layout
+  - `s` switches to split layout
 - fullscreen for new files shows the full new file content with line numbers
 
 ### Preview behavior
@@ -138,8 +141,8 @@ The preview enforces the same basic edit safety expectations:
 
 For `write`:
 
-- existing files show an overwrite diff preview
-- brand-new files show a `new-file` preview instead of a meaningless empty diff
+- existing files show a Pierre-backed overwrite diff preview
+- brand-new files stay on the dedicated `new-file` preview path instead of forcing an all-additions diff
 
 ## Bash permission behavior
 
