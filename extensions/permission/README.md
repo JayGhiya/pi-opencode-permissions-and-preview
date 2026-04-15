@@ -20,22 +20,8 @@ This extension is bundled in the `agentic-af` Pi package.
 ### Install globally from git
 
 ```bash
-pi install git:github.com/JayGhiya/agentic-af
+pi install git:github.com/JayGhiya/pi-opencode-permissions-and-preview
 ```
-
-### Install for just the current project
-
-```bash
-pi install -l git:github.com/JayGhiya/agentic-af
-```
-
-### Install from a local checkout while developing
-
-```bash
-pi install /absolute/path/to/agentic-af
-```
-
-After installing, use `pi config` if you want to enable or disable specific resources from the package.
 
 ## Core functionality
 
