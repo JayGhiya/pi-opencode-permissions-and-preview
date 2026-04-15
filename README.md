@@ -33,3 +33,4 @@ Read more in [extensions/permission/README.md](./extensions/permission/README.md
 - [Opencode](https://github.com/anomalyco/opencode)
 - [pierre diffs](https://diffs.com)
 - [pi tutorial](https://github.com/earendil-works/pi-tutorial)
+- [original_permission_extension](https://github.com/alex35mil/agentic-af)
