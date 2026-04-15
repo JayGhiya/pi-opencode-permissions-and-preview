@@ -15,13 +15,6 @@ export interface ParsedRule {
     argPattern?: string
 }
 
-export interface SkillCommandInfo {
-    name: string
-    source: "skill"
-    location: "user" | "project"
-    path: string
-}
-
 export interface SkillAllowSource {
     skill: string
     location: string

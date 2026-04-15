@@ -67,12 +67,28 @@ allowed-tools:
 
 ## Prompt Flow
 
-For askable tools, the extension presents a 4-way choice via `ctx.ui.select(...)`:
+For askable tools, the extension presents the same 4 permission outcomes:
 
 - **Allow once** — execute only this tool call
 - **Allow always for this session** — derive one or more runtime approval rules, show them in a confirmation step, and store them only for the current session
 - **Reject** — block the tool call and abort the active run
 - **Reject with feedback** — block the tool call, return corrective text to the model, and let the run continue
+
+### Generic prompt path
+
+Most tools still use the existing selector-style prompt.
+
+### `edit` / `write` review prompt
+
+For `edit` and `write`, the extension now uses a custom TUI review dialog instead of a plain `ctx.ui.select(...)` prompt.
+
+In that dialog:
+
+- compact review is shown by default inside the permission prompt
+- `ctrl+f` toggles a larger fullscreen-style review surface
+- `PgUp` / `PgDn` scroll the preview area
+- the same 4 permission outcomes are preserved
+- choosing **Allow always for this session** still routes into the existing session-rule confirmation step
 
 For non-bash tools, session approval currently stores a tool-wide runtime rule such as:
 
@@ -97,6 +113,37 @@ Examples:
 - `cd foo & uv run pytest` → only `uv run pytest` contributes, so the session rule is `bash(uv *)`
 
 If a bash command contains multiple commands, the session approval confirmation shows every derived rule that would be added from the extracted AST command nodes.
+
+### `edit` / `write` preview behavior
+
+For `edit`, the permission dialog computes a preview before execution by:
+
+1. reading the current file
+2. stripping a UTF-8 BOM if present for matching purposes
+3. normalizing line endings to LF in memory
+4. applying the requested replacements in memory only
+5. generating a preview diff from the original and resulting content
+
+The in-memory preview follows the same basic edit constraints as Pi's edit tool preview logic:
+
+- `oldText` must not be empty
+- exact match is attempted first
+- fuzzy match is used only as a fallback for minor formatting differences
+- each `oldText` must resolve uniquely
+- multi-edit ranges must not overlap
+- no-op replacements are rejected
+
+For `write`, the permission dialog distinguishes between overwrites and new files:
+
+- if the target file already exists, it reads the file and shows a diff preview
+- if the target file does not exist, it shows a `new-file` preview instead of a meaningless empty diff
+- fullscreen review for a brand-new file shows the full new content with line numbers
+
+Examples:
+
+- editing `src/app.ts` shows a compact diff in the prompt and a larger diff review on `ctrl+f`
+- writing to an existing `package.json` shows an overwrite diff preview
+- writing a brand-new `docs/plan.md` shows a concise new-file summary in compact mode and the full file contents in fullscreen mode
 
 If `Reject with feedback` is chosen, the extension asks for a short instruction such as:
 

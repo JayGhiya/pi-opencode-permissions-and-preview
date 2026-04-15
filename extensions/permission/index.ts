@@ -33,7 +33,12 @@
 
 import * as fs from "node:fs"
 
-import { parseFrontmatter, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent"
+import {
+    parseFrontmatter,
+    type ExtensionAPI,
+    type ExtensionContext,
+    type SlashCommandInfo,
+} from "@mariozechner/pi-coding-agent"
 
 import * as project from "../__lib/project.js"
 import {
@@ -56,18 +61,27 @@ import type {
     ParsedRule,
     PermissionSettings,
     RuntimeSessionState,
-    SkillCommandInfo,
 } from "./models.js"
 import { BashArity } from "./bash-arity.js"
 import { extractBashCommands } from "./bash-parser.js"
 import { resolvePermissionRejection } from "./rejection.js"
+import { showPermissionReviewDialog } from "./review-dialog.js"
+import {
+    buildEditPermissionPreview,
+    buildWritePermissionPreview,
+    type PermissionEditPreviewInput,
+    type PermissionWritePreviewInput,
+} from "./review-preview.js"
 
 const EXTENSION = "permission"
 
 // Runtime session state keyed by the active PI session id.
 const SessionStates = new Map<string, RuntimeSessionState>()
 
-const LOCAL_SKILL_LOCATIONS = new Set(["user", "project", "path"])
+type LocalSkillScope = SlashCommandInfo["sourceInfo"]["scope"]
+type LocalSkillCommandInfo = SlashCommandInfo & { source: "skill" }
+
+const LOCAL_SKILL_SCOPES = new Set<LocalSkillScope>(["user", "project"])
 
 let cachedDerivedSkillAllowState: DerivedSkillAllowState | undefined
 
@@ -290,10 +304,10 @@ function getSkillAllowedRules(skillPath: string): string[] {
     }
 }
 
-function buildSkillAllowCacheKey(skills: SkillCommandInfo[]): string {
+function buildSkillAllowCacheKey(skills: LocalSkillCommandInfo[]): string {
     return skills
         .map((skill) => {
-            const skillPath = skill.path ?? ""
+            const skillPath = skill.sourceInfo.path
             let stamp = "missing"
 
             if (skillPath) {
@@ -305,35 +319,34 @@ function buildSkillAllowCacheKey(skills: SkillCommandInfo[]): string {
                 }
             }
 
-            return `${skill.location ?? ""}:${skillPath}:${stamp}`
+            return `${skill.sourceInfo.scope}:${skillPath}:${stamp}`
         })
         .sort()
         .join("\n")
 }
 
+function isLocalSkillCommand(command: SlashCommandInfo): command is LocalSkillCommandInfo {
+    return command.source === "skill" && LOCAL_SKILL_SCOPES.has(command.sourceInfo.scope)
+}
+
 function getDerivedSkillAllowState(pi: ExtensionAPI): DerivedSkillAllowState {
     const skills = pi
         .getCommands()
-        .filter(
-            (command): command is SkillCommandInfo =>
-                command.source === "skill" &&
-                LOCAL_SKILL_LOCATIONS.has(command.location ?? "") &&
-                typeof command.path === "string",
-        )
-        .sort((a, b) => a.path.localeCompare(b.path))
+        .filter(isLocalSkillCommand)
+        .sort((a, b) => a.sourceInfo.path.localeCompare(b.sourceInfo.path))
 
     const cacheKey = buildSkillAllowCacheKey(skills)
-    if (cachedDerivedSkillAllowState?.cacheKey === cacheKey) {
+    if (cachedDerivedSkillAllowState && cachedDerivedSkillAllowState.cacheKey === cacheKey) {
         return cachedDerivedSkillAllowState
     }
 
     const sources = skills
         .map((skill) => {
-            const rules = getSkillAllowedRules(skill.path)
+            const rules = getSkillAllowedRules(skill.sourceInfo.path)
             return {
                 skill: skill.name.replace(/^skill:/, ""),
-                location: skill.location ?? "",
-                path: skill.path,
+                location: skill.sourceInfo.scope,
+                path: skill.sourceInfo.path,
                 rules,
             }
         })
@@ -461,6 +474,16 @@ async function promptForPermission(
     argValue: string | undefined,
     ctx: ExtensionContext,
 ): Promise<PermissionPromptChoice | undefined> {
+    if (toolName === "edit") {
+        const preview = await buildEditPermissionPreview(asEditToolInput(input), ctx.cwd)
+        return showPermissionReviewDialog(ctx, preview)
+    }
+
+    if (toolName === "write") {
+        const preview = await buildWritePermissionPreview(asWriteToolInput(input), ctx.cwd)
+        return showPermissionReviewDialog(ctx, preview)
+    }
+
     const title = buildPromptTitle(toolName, input, argValue)
     const choice = await ctx.ui.select(title, [...PERMISSION_CHOICES])
     return isPermissionPromptChoice(choice) ? choice : undefined
@@ -523,6 +546,30 @@ function getBashAlwaysPattern(tokens: string[]): string | undefined {
     const prefix = BashArity.prefix(tokens)
     if (prefix.length === 0) return undefined
     return `bash(${prefix.join(" ")} *)`
+}
+
+function asEditToolInput(input: Record<string, unknown>): PermissionEditPreviewInput {
+    return {
+        path: typeof input.path === "string" ? input.path : "",
+        edits: Array.isArray(input.edits)
+            ? input.edits
+                  .filter(
+                      (edit): edit is { oldText: string; newText: string } =>
+                          typeof edit === "object" &&
+                          edit !== null &&
+                          typeof edit.oldText === "string" &&
+                          typeof edit.newText === "string",
+                  )
+                  .map((edit) => ({ oldText: edit.oldText, newText: edit.newText }))
+            : [],
+    }
+}
+
+function asWriteToolInput(input: Record<string, unknown>): PermissionWritePreviewInput {
+    return {
+        path: typeof input.path === "string" ? input.path : "",
+        content: typeof input.content === "string" ? input.content : "",
+    }
 }
 
 function isPermissionPromptChoice(value: string | undefined): value is PermissionPromptChoice {
