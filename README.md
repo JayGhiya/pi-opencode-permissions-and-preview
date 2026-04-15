@@ -1,4 +1,4 @@
-# agentic-af
+# Opencode style permissions and preview
 
 A Pi package for agentic coding workflows, with a focus on stronger tool permissions, better edit/write review, and practical extensions for everyday use.
 
