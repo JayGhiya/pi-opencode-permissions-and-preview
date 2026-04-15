@@ -18,6 +18,9 @@ const COMPACT_MAX_HEIGHT = 24
 const COMPACT_MAX_WIDTH = 110
 const FULLSCREEN_SPLIT_WIDTH = 140
 const FULLSCREEN_MIN_HEIGHT = 18
+const FULLSCREEN_HORIZONTAL_INSET = 4
+const FULLSCREEN_TOP_OFFSET = 1
+const FULLSCREEN_LEFT_OFFSET = 2
 const HORIZONTAL_PADDING = 3
 
 export async function showPermissionReviewDialog(
@@ -60,14 +63,20 @@ class PermissionReviewDialog implements Component {
         const columns = this.tui.terminal.columns
         const rows = this.tui.terminal.rows
 
+        if (this.fullscreen) {
+            return {
+                anchor: "top-left",
+                col: FULLSCREEN_LEFT_OFFSET,
+                row: FULLSCREEN_TOP_OFFSET,
+                width: Math.max(70, columns - FULLSCREEN_HORIZONTAL_INSET),
+                maxHeight: Math.max(FULLSCREEN_MIN_HEIGHT, rows - FULLSCREEN_TOP_OFFSET),
+            }
+        }
+
         return {
             anchor: "center",
-            width: this.fullscreen
-                ? Math.max(70, Math.min(columns - 2, 160))
-                : Math.max(60, Math.min(columns - 6, COMPACT_MAX_WIDTH)),
-            maxHeight: this.fullscreen
-                ? Math.max(FULLSCREEN_MIN_HEIGHT, Math.min(rows - 2, rows))
-                : Math.max(16, Math.min(rows - 6, COMPACT_MAX_HEIGHT)),
+            width: Math.max(60, Math.min(columns - 6, COMPACT_MAX_WIDTH)),
+            maxHeight: Math.max(16, Math.min(rows - 6, COMPACT_MAX_HEIGHT)),
         }
     }
 
@@ -357,11 +366,24 @@ class PermissionReviewDialog implements Component {
     }
 
     private renderBodyLine(width: number, content: string): string {
+        if (this.fullscreen) {
+            const bodyWidth = Math.max(1, width - 2)
+            return this.renderFullscreenLine(content, bodyWidth)
+        }
+
         const bodyWidth = Math.max(1, width - 4)
         return `${this.theme.fg("border", "│")} ${truncateToWidth(content, bodyWidth, "…", true)} ${this.theme.fg("border", "│")}`
     }
 
     private renderBorder(width: number, kind: "top" | "middle" | "bottom"): string {
+        if (this.fullscreen) {
+            const bodyWidth = Math.max(1, width - 2)
+            if (kind === "middle") {
+                return this.renderFullscreenLine("", bodyWidth)
+            }
+            return this.renderFullscreenLine("", bodyWidth)
+        }
+
         const innerWidth = Math.max(1, width - 2)
 
         if (kind === "top") {
@@ -373,6 +395,13 @@ class PermissionReviewDialog implements Component {
         }
 
         return `${this.theme.fg("border", "├")}${this.theme.fg("border", "─".repeat(innerWidth))}${this.theme.fg("border", "┤")}`
+    }
+
+    private renderFullscreenLine(content: string, width: number): string {
+        const prefix = `${this.theme.fg("warning", "┃")} `
+        const truncated = truncateToWidth(content, width, "…", true)
+        const padding = Math.max(0, width - visibleWidth(truncated))
+        return `${prefix}${truncated}${" ".repeat(padding)}`
     }
 }
 

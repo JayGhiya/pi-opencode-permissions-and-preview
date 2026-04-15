@@ -1,15 +1,41 @@
 # agentic-af
 
-My [pi](https://pi.dev) setup for coding agent workflows.
+A Pi package for agentic coding workflows, with a focus on stronger tool permissions, better edit/write review, and practical extensions for everyday use.
 
-> [!IMPORTANT]
-> This setup is built for [pi.nvim](https://github.com/alex35mil/pi.nvim). Some extensions (notably [permission](./extensions/permission/)) rely on the Neovim plugin for UI interactions like edit reviews. Using this package with the pi TUI will most likely require adjustments.
+## Install in Pi
 
-## Extensions
+### Global install from git
 
-- [**context**](extensions/context/) — `/context` command for session introspection
-- [**fetch**](extensions/fetch/) — `fetch` tool for retrieving URLs as markdown
-- [**mcp**](extensions/mcp/) — MCP server integration
-- [**permission**](extensions/permission/) — tool execution control with allow/deny/ask rules
-- [**rules**](extensions/rules/) — rule files injected into system prompt
-- [**web-search**](extensions/web-search/) — `web_search` tool via Brave Search API
+```bash
+pi install git:github.com/JayGhiya/agentic-af
+```
+
+### Project-local install
+
+```bash
+pi install -l git:github.com/JayGhiya/agentic-af
+```
+
+### Local development install
+
+```bash
+pi install /absolute/path/to/agentic-af
+```
+
+## Included extension highlight: permission
+
+The `permission` extension adds a configurable permission layer on top of Pi tool calls.
+
+### Brief functionality
+
+- `allow` / `deny` / `ask` rules for tool calls
+- session-only approvals
+- AST-aware bash permission matching
+- custom preview and review UI for `edit` and `write`
+- diff preview for overwrites and edits
+- full-content preview for brand-new writes
+- reject with feedback flow
+
+For `edit` and `write`, the permission prompt includes a compact preview and a larger review mode with `Ctrl+F`, plus scrolling with `PgUp` / `PgDn`.
+
+Read more in [extensions/permission/README.md](./extensions/permission/README.md).

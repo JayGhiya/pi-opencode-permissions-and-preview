@@ -1,17 +1,64 @@
 # Permission Extension
 
-Controls tool execution with configurable allow/deny/ask rules. When a tool call is not already resolved by settings, the extension uses an OpenCode-style prompt flow:
+A Pi extension for controlling tool execution with configurable `allow`, `deny`, and `ask` rules.
 
-- Allow once
-- Allow always for this session
-- Reject
-- Reject with feedback
+It adds a permission layer in front of tool calls such as `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`, and `fetch`, and gives you a better review experience for file edits before they run.
 
-Session approvals are kept in memory only and are scoped to the active PI session. Switching sessions uses each session's own runtime approvals, and a brand new session starts with none.
+## What it does
+
+- blocks, allows, or prompts for tool calls using simple rules
+- supports one-off approval or session-only approval
+- adds a richer review UI for `edit` and `write`
+- previews overwrites and new files before execution
+- parses bash with Tree-sitter so permission checks work on extracted shell commands instead of naive string splitting
+- lets trusted local skills contribute extra allow rules via frontmatter
+
+## Install in Pi
+
+This extension is bundled in the `agentic-af` Pi package.
+
+### Install globally from git
+
+```bash
+pi install git:github.com/JayGhiya/agentic-af
+```
+
+### Install for just the current project
+
+```bash
+pi install -l git:github.com/JayGhiya/agentic-af
+```
+
+### Install from a local checkout while developing
+
+```bash
+pi install /absolute/path/to/agentic-af
+```
+
+After installing, use `pi config` if you want to enable or disable specific resources from the package.
+
+## Core functionality
+
+The extension evaluates tool calls in this order:
+
+```text
+deny > session approvals > ask > allow > defaultMode
+```
+
+When a tool call resolves to `ask`, Pi shows one of these outcomes:
+
+- **Allow once**
+- **Allow always for this session**
+- **Reject**
+- **Reject with feedback**
+
+Session approvals are in-memory only and scoped to the current Pi session.
 
 ## Configuration
 
-Settings file: `permission.settings.json` (3-tier loading):
+Settings file: `permission.settings.json`
+
+Pi loads and merges 3 tiers:
 
 | Tier    | Path                                                 |
 | ------- | ---------------------------------------------------- |
@@ -19,28 +66,28 @@ Settings file: `permission.settings.json` (3-tier loading):
 | Project | `<repo-root>/.agents/permission.settings.json`       |
 | Local   | `<repo-root>/.agents/permission.settings.local.json` |
 
-### Schema
+### Example
 
 ```json
 {
-    "defaultMode": "ask",
-    "allow": ["read", "bash(git *)"],
-    "deny": ["bash(rm -rf *)"],
-    "ask": ["write", "edit"],
-    "keybindings": {
-        "autoAcceptEdits": "ctrl+shift+a"
-    }
+  "defaultMode": "ask",
+  "allow": ["read", "bash(git status *)"],
+  "deny": ["bash(rm -rf *)"],
+  "ask": ["edit", "write", "bash(npm publish *)"],
+  "keybindings": {
+    "autoAcceptEdits": "ctrl+shift+a"
+  }
 }
 ```
 
-### Rule Format
+## Rule format
 
-- `"read"` — blanket match on tool name
-- `"mcp__playwright__*"` — glob match on tool name
-- `"bash(git *)"` — match tool `bash` where command matches `git *`
-- `"edit(/tmp/*)"` — match tool `edit` where path matches `/tmp/*`
+- `"read"` — match a tool name directly
+- `"mcp__playwright__*"` — glob-match tool names
+- `"bash(git *)"` — match `bash` when the extracted command matches `git *`
+- `"edit(/tmp/*)"` — match `edit` when the path matches `/tmp/*`
 
-### Argument Matching
+### What each tool matches against
 
 | Tool                    | Matched against                                      |
 | ----------------------- | ---------------------------------------------------- |
@@ -49,131 +96,99 @@ Settings file: `permission.settings.json` (3-tier loading):
 | `grep`, `find`, `ls`    | path argument                                        |
 | `fetch`                 | URL                                                  |
 
-### Evaluation Order
+## Edit and write preview UI
 
-`deny` > session approvals > `ask` > `allow` > `defaultMode` (default: `"ask"`)
+`edit` and `write` use a custom review dialog instead of a plain selector.
 
-### Skill-Derived Rules
+### Compact review
 
-Trusted local skills (global + project) can contribute allow rules via YAML frontmatter:
+By default, the permission prompt shows a compact preview:
 
-```yaml
----
-allowed-tools:
-    - "bash(ls *)"
-    - "read"
----
-```
+- diff preview for edits and overwrites
+- concise new-file summary for brand-new writes
+- the same 4 permission outcomes as every other ask flow
 
-## Prompt Flow
+### Full review
 
-For askable tools, the extension presents the same 4 permission outcomes:
+Inside the dialog:
 
-- **Allow once** — execute only this tool call
-- **Allow always for this session** — derive one or more runtime approval rules, show them in a confirmation step, and store them only for the current session
-- **Reject** — block the tool call and abort the active run
-- **Reject with feedback** — block the tool call, return corrective text to the model, and let the run continue
-
-### Generic prompt path
-
-Most tools still use the existing selector-style prompt.
-
-### `edit` / `write` review prompt
-
-For `edit` and `write`, the extension now uses a custom TUI review dialog instead of a plain `ctx.ui.select(...)` prompt.
-
-In that dialog:
-
-- compact review is shown by default inside the permission prompt
-- `ctrl+f` toggles a larger fullscreen-style review surface
+- `Ctrl+F` toggles fullscreen review
 - `PgUp` / `PgDn` scroll the preview area
-- the same 4 permission outcomes are preserved
-- choosing **Allow always for this session** still routes into the existing session-rule confirmation step
+- fullscreen for existing files shows a larger diff view
+- fullscreen for new files shows the full new file content with line numbers
 
-For non-bash tools, session approval currently stores a tool-wide runtime rule such as:
+### Preview behavior
 
-- `edit`
-- `write`
-- `read`
-- `fetch`
+For `edit`, the extension previews changes in memory before execution by:
 
-For bash, the extension mirrors upstream OpenCode more closely:
+1. reading the current file
+2. stripping a UTF-8 BOM for matching
+3. normalizing line endings to LF
+4. applying the requested replacements in memory only
+5. generating a diff from the original and resulting content
 
-1. parse the full shell input with Tree-sitter
-2. walk AST `command` nodes
-3. skip cwd-only commands like `cd`
-4. evaluate permissions only against the extracted command texts
-5. build session-approval wildcard rules from the extracted command tokens
+The preview enforces the same basic edit safety expectations:
+
+- `oldText` must not be empty
+- exact match is tried first
+- fuzzy match is only a fallback for minor formatting differences
+- each `oldText` must resolve uniquely
+- edits must not overlap
+- no-op replacements are rejected
+
+For `write`:
+
+- existing files show an overwrite diff preview
+- brand-new files show a `new-file` preview instead of a meaningless empty diff
+
+## Bash permission behavior
+
+Bash is handled more carefully than simple string matching.
+
+The extension:
+
+1. parses the full shell input with Tree-sitter
+2. walks extracted AST `command` nodes
+3. skips cwd-only commands like `cd`
+4. evaluates permission rules against the extracted commands
+5. derives session approval patterns from command tokens
 
 Examples:
 
 - `git checkout main` → `bash(git checkout *)`
 - `npm run dev` → `bash(npm run dev *)`
-- `uv run app.py` → `bash(uv *)`
-- `cd foo & uv run pytest` → only `uv run pytest` contributes, so the session rule is `bash(uv *)`
+- `uv run pytest` → `bash(uv *)`
+- `cd foo & uv run pytest` → only `uv run pytest` contributes, so session approval becomes `bash(uv *)`
 
-If a bash command contains multiple commands, the session approval confirmation shows every derived rule that would be added from the extracted AST command nodes.
+This avoids many false matches that happen with naive shell splitting.
 
-### `edit` / `write` preview behavior
+## Skill-derived allow rules
 
-For `edit`, the permission dialog computes a preview before execution by:
+Trusted local skills can contribute extra allow rules through frontmatter:
 
-1. reading the current file
-2. stripping a UTF-8 BOM if present for matching purposes
-3. normalizing line endings to LF in memory
-4. applying the requested replacements in memory only
-5. generating a preview diff from the original and resulting content
+```yaml
+---
+allowed-tools:
+  - "read"
+  - "bash(git status *)"
+---
+```
 
-The in-memory preview follows the same basic edit constraints as Pi's edit tool preview logic:
-
-- `oldText` must not be empty
-- exact match is attempted first
-- fuzzy match is used only as a fallback for minor formatting differences
-- each `oldText` must resolve uniquely
-- multi-edit ranges must not overlap
-- no-op replacements are rejected
-
-For `write`, the permission dialog distinguishes between overwrites and new files:
-
-- if the target file already exists, it reads the file and shows a diff preview
-- if the target file does not exist, it shows a `new-file` preview instead of a meaningless empty diff
-- fullscreen review for a brand-new file shows the full new content with line numbers
-
-Examples:
-
-- editing `src/app.ts` shows a compact diff in the prompt and a larger diff review on `ctrl+f`
-- writing to an existing `package.json` shows an overwrite diff preview
-- writing a brand-new `docs/plan.md` shows a concise new-file summary in compact mode and the full file contents in fullscreen mode
-
-If `Reject with feedback` is chosen, the extension asks for a short instruction such as:
-
-- `Do not edit this generated file directly; update the source template instead.`
-- `Do not run this command yet; inspect the logs first.`
-
-An empty or cancelled feedback input returns to the permission menu instead of hard-rejecting.
-
-## Bash Permission Behavior
-
-- Bash input is parsed as a full shell program with Tree-sitter instead of being permission-checked by raw string splitting
-- Permissions are evaluated against extracted AST `command` nodes, and the strictest mode across those extracted commands wins
-- Cwd-only commands like `cd` are skipped for bash permission derivation and evaluation, so `cd foo` alone does not contribute a bash approval rule
-- Session approval wildcard rules use upstream-style arity fallback, so unknown command families fall back to the first token, e.g. `uv run pytest` → `bash(uv *)`
-- Headless mode (no UI) blocks all `"ask"` calls
-- Deny rules still take precedence over session approvals
+These do **not** bypass permission entirely. They just add more allow rules for tool calls.
 
 ## Commands
 
 | Command                          | Description                                                                                |
 | -------------------------------- | ------------------------------------------------------------------------------------------ |
-| `/permission-toggle-auto-accept` | Toggle auto-accept for edit/write tools in the current session                             |
+| `/permission-toggle-auto-accept` | Toggle auto-accept for `edit` / `write` in the current session                            |
 | `/permission-settings`           | Show resolved settings, skill-derived rules, session-approved rules, and session overrides |
 
 ## Observability
 
 Use `/permission-settings` to inspect:
 
-- persisted settings
-- effective settings including runtime session approvals
+- merged persisted settings
+- effective settings including session approvals
 - skill-derived allow rules and their sources
 - session-approved runtime rules
-- session mode overrides such as auto-accept edits
+- mode overrides such as auto-accept for edits
