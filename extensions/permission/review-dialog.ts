@@ -3,7 +3,6 @@ import {
     highlightCode,
     keyHint,
     rawKeyHint,
-    renderDiff,
     type ExtensionContext,
     type KeybindingsManager,
     type Theme,
@@ -12,72 +11,86 @@ import type { Component, OverlayOptions, TUI } from "@mariozechner/pi-tui"
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui"
 
 import { PERMISSION_CHOICES, type PermissionPromptChoice } from "./constants.js"
+import { renderSplitDiffLines, renderUnifiedDiffLines } from "./pierre-rows.js"
+import { getPierreAppearance, getPierrePalette } from "./pierre-theme.js"
 import type { PermissionDiffPreview, PermissionNewFilePreview, PermissionReviewPreview } from "./review-preview.js"
 
 const COMPACT_MAX_HEIGHT = 24
 const COMPACT_MAX_WIDTH = 110
-const FULLSCREEN_SPLIT_WIDTH = 140
 const FULLSCREEN_MIN_HEIGHT = 18
 const FULLSCREEN_HORIZONTAL_INSET = 4
 const FULLSCREEN_TOP_OFFSET = 1
 const FULLSCREEN_LEFT_OFFSET = 2
 const HORIZONTAL_PADDING = 3
 
+type PermissionReviewDialogResult = PermissionPromptChoice | undefined | PermissionReviewDialogToggle
+
+interface PermissionReviewDialogToggle {
+    kind: "toggle-fullscreen"
+    state: PermissionReviewDialogState
+}
+
+type FullscreenDiffStyle = "unified" | "split"
+
+interface PermissionReviewDialogState {
+    fullscreen: boolean
+    selectedIndex: number
+    scrollOffset: number
+    fullscreenDiffStyle: FullscreenDiffStyle
+}
+
 export async function showPermissionReviewDialog(
     ctx: ExtensionContext,
     preview: PermissionReviewPreview,
 ): Promise<PermissionPromptChoice | undefined> {
-    let dialog: PermissionReviewDialog | undefined
+    let state: PermissionReviewDialogState = {
+        fullscreen: false,
+        selectedIndex: 0,
+        scrollOffset: 0,
+        fullscreenDiffStyle: "unified",
+    }
 
-    return ctx.ui.custom<PermissionPromptChoice | undefined>(
-        (
-            tui: TUI,
-            theme: Theme,
-            keybindings: KeybindingsManager,
-            done: (result: PermissionPromptChoice | undefined) => void,
-        ) => {
-            dialog = new PermissionReviewDialog(tui, theme, keybindings, preview, done)
-            return dialog
-        },
-        {
-            overlay: true,
-            overlayOptions: () => dialog?.getOverlayOptions() ?? { anchor: "center", width: 80, maxHeight: 20 },
-        },
-    )
+    while (true) {
+        const result = await ctx.ui.custom<PermissionReviewDialogResult>(
+            (
+                tui: TUI,
+                theme: Theme,
+                keybindings: KeybindingsManager,
+                done: (value: PermissionReviewDialogResult) => void,
+            ) => new PermissionReviewDialog(tui, theme, keybindings, preview, state, done),
+            {
+                overlay: true,
+                overlayOptions: getOverlayOptions(state, process.stdout.columns ?? 80, process.stdout.rows ?? 24),
+            },
+        )
+
+        if (isToggleResult(result)) {
+            state = result.state
+            continue
+        }
+
+        return result
+    }
 }
 
 class PermissionReviewDialog implements Component {
-    private selectedIndex = 0
-    private fullscreen = false
-    private scrollOffset = 0
+    private selectedIndex: number
+    private fullscreen: boolean
+    private scrollOffset: number
+    private fullscreenDiffStyle: FullscreenDiffStyle
 
     constructor(
         private readonly tui: TUI,
         private readonly theme: Theme,
         private readonly keybindings: KeybindingsManager,
         private readonly preview: PermissionReviewPreview,
-        private readonly done: (result: PermissionPromptChoice | undefined) => void,
-    ) {}
-
-    getOverlayOptions(): OverlayOptions {
-        const columns = this.tui.terminal.columns
-        const rows = this.tui.terminal.rows
-
-        if (this.fullscreen) {
-            return {
-                anchor: "top-left",
-                col: FULLSCREEN_LEFT_OFFSET,
-                row: FULLSCREEN_TOP_OFFSET,
-                width: Math.max(70, columns - FULLSCREEN_HORIZONTAL_INSET),
-                maxHeight: Math.max(FULLSCREEN_MIN_HEIGHT, rows - FULLSCREEN_TOP_OFFSET),
-            }
-        }
-
-        return {
-            anchor: "center",
-            width: Math.max(60, Math.min(columns - 6, COMPACT_MAX_WIDTH)),
-            maxHeight: Math.max(16, Math.min(rows - 6, COMPACT_MAX_HEIGHT)),
-        }
+        initialState: PermissionReviewDialogState,
+        private readonly done: (result: PermissionReviewDialogResult) => void,
+    ) {
+        this.selectedIndex = initialState.selectedIndex
+        this.fullscreen = initialState.fullscreen
+        this.scrollOffset = initialState.scrollOffset
+        this.fullscreenDiffStyle = initialState.fullscreenDiffStyle
     }
 
     invalidate(): void {}
@@ -107,10 +120,30 @@ class PermissionReviewDialog implements Component {
             return
         }
 
-        if (matchesCtrlF(data)) {
-            this.fullscreen = !this.fullscreen
+        if (this.fullscreen && this.preview.kind === "diff" && matchesUnifiedLayoutShortcut(data)) {
+            this.fullscreenDiffStyle = "unified"
             this.scrollOffset = 0
-            this.requestRender(true)
+            this.requestRender()
+            return
+        }
+
+        if (this.fullscreen && this.preview.kind === "diff" && matchesSplitLayoutShortcut(data)) {
+            this.fullscreenDiffStyle = "split"
+            this.scrollOffset = 0
+            this.requestRender()
+            return
+        }
+
+        if (matchesCtrlF(data)) {
+            this.done({
+                kind: "toggle-fullscreen",
+                state: {
+                    fullscreen: !this.fullscreen,
+                    selectedIndex: this.selectedIndex,
+                    scrollOffset: 0,
+                    fullscreenDiffStyle: this.fullscreenDiffStyle,
+                },
+            })
             return
         }
 
@@ -132,7 +165,7 @@ class PermissionReviewDialog implements Component {
         const actionLines = this.getActionLines(frameWidth)
         const hintLines = wrapSection(this.getHintText(), frameWidth, this.theme)
 
-        const maxHeight = this.getOverlayOptions().maxHeight
+        const maxHeight = getOverlayOptions(this.getState(), this.tui.terminal.columns, this.tui.terminal.rows).maxHeight
         const availableHeight = typeof maxHeight === "number" ? maxHeight : this.tui.terminal.rows - 2
         const previewHeight = Math.max(
             4,
@@ -160,6 +193,15 @@ class PermissionReviewDialog implements Component {
         this.tui.requestRender(force)
     }
 
+    private getState(): PermissionReviewDialogState {
+        return {
+            fullscreen: this.fullscreen,
+            selectedIndex: this.selectedIndex,
+            scrollOffset: this.scrollOffset,
+            fullscreenDiffStyle: this.fullscreenDiffStyle,
+        }
+    }
+
     private getTitle(): string {
         const action = this.preview.toolName === "edit" ? "Edit" : this.preview.kind === "new-file" ? "Create" : "Write"
         const path = formatDisplayPath(this.preview.path)
@@ -169,7 +211,11 @@ class PermissionReviewDialog implements Component {
 
     private getMeta(): string {
         if (this.preview.kind === "diff") {
-            const mode = this.fullscreen && this.useSplitDiffView() ? "split diff" : "unified diff"
+            const mode = this.fullscreen
+                ? this.fullscreenDiffStyle === "split"
+                    ? "split diff"
+                    : "stacked diff"
+                : "stacked diff"
             const stats = `${this.theme.fg("success", `+${this.preview.addedLines}`)} ${this.theme.fg("error", `-${this.preview.removedLines}`)}`
             const changed =
                 this.preview.firstChangedLine === undefined
@@ -196,12 +242,18 @@ class PermissionReviewDialog implements Component {
     }
 
     private getHintText(): string {
-        const scrollHint = rawKeyHint("PgUp/PgDn", "scroll")
+        const scrollHint = rawKeyHint(getScrollHintLabel(), "scroll")
         const fullscreenHint = rawKeyHint("Ctrl+F", this.fullscreen ? "compact" : "fullscreen")
+        const layoutHints =
+            this.preview.kind === "diff" && this.fullscreen
+                ? [rawKeyHint("u", "stacked"), rawKeyHint("s", "split")]
+                : []
+
         return [
             rawKeyHint("↑↓", "choose"),
             keyHint("tui.select.confirm", "select"),
             fullscreenHint,
+            ...layoutHints,
             scrollHint,
             keyHint("tui.select.cancel", "cancel"),
         ].join("  ")
@@ -261,7 +313,7 @@ class PermissionReviewDialog implements Component {
     private buildPreviewLines(width: number): string[] {
         switch (this.preview.kind) {
             case "diff":
-                return this.fullscreen && this.useSplitDiffView()
+                return this.fullscreen && this.fullscreenDiffStyle === "split"
                     ? this.renderSplitDiff(this.preview, width)
                     : this.renderUnifiedDiff(this.preview, width)
             case "new-file":
@@ -272,68 +324,36 @@ class PermissionReviewDialog implements Component {
     }
 
     private renderUnifiedDiff(preview: PermissionDiffPreview, width: number): string[] {
-        if (!preview.diff) {
+        if (preview.addedLines === 0 && preview.removedLines === 0) {
             return [this.theme.fg("muted", "No textual changes detected.")]
         }
 
-        const diffText = renderDiff(preview.diff, { filePath: preview.path })
-        const baseLines = diffText.split("\n")
-        if (!this.fullscreen) {
-            return baseLines.map((line) => truncateToWidth(line, width, "…", true))
-        }
+        const palette = getPierrePalette(this.theme)
+        const appearance = getPierreAppearance(this.theme)
 
-        return baseLines.flatMap((line: string) => {
-            const wrapped = wrapTextWithAnsi(line, width)
-            return wrapped.length > 0 ? wrapped : [""]
+        return renderUnifiedDiffLines({
+            metadata: preview.metadata,
+            highlighted: preview.highlighted[appearance],
+            palette,
+            width,
+            wrap: this.fullscreen,
         })
     }
 
     private renderSplitDiff(preview: PermissionDiffPreview, width: number): string[] {
-        if (!preview.diff) {
+        if (preview.addedLines === 0 && preview.removedLines === 0) {
             return [this.theme.fg("muted", "No textual changes detected.")]
         }
 
-        const separator = this.theme.fg("border", " │ ")
-        const columnWidth = Math.max(10, Math.floor((width - visibleWidth(separator)) / 2))
-        const rows = [
-            this.joinSplitColumns(
-                this.theme.fg("muted", this.theme.bold("before")),
-                this.theme.fg("muted", this.theme.bold("after")),
-                columnWidth,
-                separator,
-            ),
-        ]
+        const palette = getPierrePalette(this.theme)
+        const appearance = getPierreAppearance(this.theme)
 
-        const entries = preview.diff.split("\n").map((line) => parseDiffEntry(line, this.theme))
-
-        for (let index = 0; index < entries.length; ) {
-            const entry = entries[index]
-            if (entry.kind === "remove" || entry.kind === "add") {
-                const removed: string[] = []
-                const added: string[] = []
-
-                while (entries[index]?.kind === "remove") {
-                    removed.push(entries[index].formatted)
-                    index += 1
-                }
-
-                while (entries[index]?.kind === "add") {
-                    added.push(entries[index].formatted)
-                    index += 1
-                }
-
-                const pairCount = Math.max(removed.length, added.length)
-                for (let rowIndex = 0; rowIndex < pairCount; rowIndex += 1) {
-                    rows.push(this.joinSplitColumns(removed[rowIndex] ?? "", added[rowIndex] ?? "", columnWidth, separator))
-                }
-                continue
-            }
-
-            rows.push(this.joinSplitColumns(entry.formatted, entry.formatted, columnWidth, separator))
-            index += 1
-        }
-
-        return rows
+        return renderSplitDiffLines({
+            metadata: preview.metadata,
+            highlighted: preview.highlighted[appearance],
+            palette,
+            width,
+        })
     }
 
     private renderNewFile(preview: PermissionNewFilePreview, width: number): string[] {
@@ -351,14 +371,6 @@ class PermissionReviewDialog implements Component {
             const wrapped = wrapTextWithAnsi(numbered, width)
             return wrapped.length > 0 ? wrapped : [""]
         })
-    }
-
-    private joinSplitColumns(left: string, right: string, columnWidth: number, separator: string): string {
-        return `${truncateToWidth(left, columnWidth, "…", true)}${separator}${truncateToWidth(right, columnWidth, "…", true)}`
-    }
-
-    private useSplitDiffView(): boolean {
-        return this.tui.terminal.columns >= FULLSCREEN_SPLIT_WIDTH
     }
 
     private getScrollPageSize(): number {
@@ -405,6 +417,32 @@ class PermissionReviewDialog implements Component {
     }
 }
 
+function getOverlayOptions(state: PermissionReviewDialogState, columns: number, rows: number): OverlayOptions {
+    if (state.fullscreen) {
+        return {
+            anchor: "top-left",
+            col: FULLSCREEN_LEFT_OFFSET,
+            row: FULLSCREEN_TOP_OFFSET,
+            width: Math.max(70, columns - FULLSCREEN_HORIZONTAL_INSET),
+            maxHeight: Math.max(FULLSCREEN_MIN_HEIGHT, rows - FULLSCREEN_TOP_OFFSET),
+        }
+    }
+
+    return {
+        anchor: "center",
+        width: Math.max(60, Math.min(columns - 6, COMPACT_MAX_WIDTH)),
+        maxHeight: Math.max(16, Math.min(rows - 6, COMPACT_MAX_HEIGHT)),
+    }
+}
+
+function isToggleResult(result: PermissionReviewDialogResult): result is PermissionReviewDialogToggle {
+    return typeof result === "object" && result !== null && result.kind === "toggle-fullscreen"
+}
+
+function getScrollHintLabel(): string {
+    return process.platform === "darwin" ? "Fn+↑/Fn+↓" : "PgUp/PgDn"
+}
+
 function wrapSection(text: string, width: number, theme: Theme): string[] {
     if (!text) return [" ".repeat(width)]
 
@@ -433,21 +471,11 @@ function matchesCtrlF(data: string): boolean {
     return data === "\u0006" || data === "\u001b[102;5u" || data === "\u001b[102:102;5u"
 }
 
-function parseDiffEntry(line: string, theme: Theme): ParsedDiffEntry {
-    if (line.startsWith("+")) {
-        return { kind: "add", formatted: theme.fg("toolDiffAdded", line) }
-    }
-    if (line.startsWith("-")) {
-        return { kind: "remove", formatted: theme.fg("toolDiffRemoved", line) }
-    }
-    if (line.includes("...")) {
-        return { kind: "ellipsis", formatted: theme.fg("muted", line) }
-    }
-    return { kind: "context", formatted: theme.fg("toolDiffContext", line) }
+function matchesUnifiedLayoutShortcut(data: string): boolean {
+    return data === "u" || data === "U"
 }
 
-interface ParsedDiffEntry {
-    kind: "add" | "remove" | "context" | "ellipsis"
-    formatted: string
+function matchesSplitLayoutShortcut(data: string): boolean {
+    return data === "s" || data === "S"
 }
 
