@@ -108,6 +108,8 @@ Inside the dialog:
 
 ### Preview behavior
 
+If preview construction fails for `edit` or `write` — for example file-not-found, non-unique `oldText`, overlapping edits, or other preview validation errors — the extension does **not** show the review dialog. It automatically blocks the tool call with feedback equal to the exact underlying error, matching Pi's native `edit` behavior.
+
 For `edit`, the extension previews changes in memory before execution by:
 
 1. reading the current file

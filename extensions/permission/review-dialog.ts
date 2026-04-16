@@ -11,7 +11,7 @@ import type { Component, OverlayOptions, TUI } from "@mariozechner/pi-tui"
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui"
 
 import { PERMISSION_CHOICES, type PermissionPromptChoice } from "./constants.js"
-import { renderSplitDiffLines, renderUnifiedDiffLines } from "./pierre-rows.js"
+import { renderSplitDiffLines, renderUnifiedDiffLines, type PreviewDisplayLine } from "./pierre-rows.js"
 import { getPierreAppearance, getPierrePalette } from "./pierre-theme.js"
 import type { PermissionDiffPreview, PermissionNewFilePreview, PermissionReviewPreview } from "./review-preview.js"
 
@@ -274,12 +274,14 @@ class PermissionReviewDialog implements Component {
         const indicatorSlots = Number(showTopIndicator) + Number(showBottomIndicator)
         const contentHeight = Math.max(1, safeHeight - indicatorSlots)
         const visibleLines = allLines.slice(clampedOffset, clampedOffset + contentHeight)
+        const hiddenTopSourceLines = countSourceLines(allLines.slice(0, clampedOffset))
+        const hiddenBottomSourceLines = countSourceLines(allLines.slice(clampedOffset + contentHeight))
         const lines: string[] = []
 
         if (showTopIndicator) {
             lines.push(
                 truncateToWidth(
-                    this.theme.fg("muted", `↑ ${clampedOffset} line${clampedOffset === 1 ? "" : "s"} above`),
+                    this.theme.fg("muted", `↑ ${hiddenTopSourceLines} line${hiddenTopSourceLines === 1 ? "" : "s"} above`),
                     width,
                     "…",
                     true,
@@ -288,14 +290,13 @@ class PermissionReviewDialog implements Component {
         }
 
         for (const line of visibleLines) {
-            lines.push(truncateToWidth(line, width, "…", true))
+            lines.push(truncateToWidth(line.text, width, "…", true))
         }
 
         if (showBottomIndicator) {
-            const remaining = allLines.length - clampedOffset - contentHeight
             lines.push(
                 truncateToWidth(
-                    this.theme.fg("muted", `↓ ${remaining} more line${remaining === 1 ? "" : "s"}`),
+                    this.theme.fg("muted", `↓ ${hiddenBottomSourceLines} more line${hiddenBottomSourceLines === 1 ? "" : "s"}`),
                     width,
                     "…",
                     true,
@@ -310,7 +311,7 @@ class PermissionReviewDialog implements Component {
         return lines
     }
 
-    private buildPreviewLines(width: number): string[] {
+    private buildPreviewLines(width: number): PreviewDisplayLine[] {
         switch (this.preview.kind) {
             case "diff":
                 return this.fullscreen && this.fullscreenDiffStyle === "split"
@@ -319,13 +320,16 @@ class PermissionReviewDialog implements Component {
             case "new-file":
                 return this.renderNewFile(this.preview, width)
             case "error":
-                return wrapSection(this.theme.fg("error", this.preview.error), width, this.theme)
+                return wrapSection(this.theme.fg("error", this.preview.error), width, this.theme).map((text) => ({
+                    text,
+                    sourceLineKeys: [],
+                }))
         }
     }
 
-    private renderUnifiedDiff(preview: PermissionDiffPreview, width: number): string[] {
+    private renderUnifiedDiff(preview: PermissionDiffPreview, width: number): PreviewDisplayLine[] {
         if (preview.addedLines === 0 && preview.removedLines === 0) {
-            return [this.theme.fg("muted", "No textual changes detected.")]
+            return [{ text: this.theme.fg("muted", "No textual changes detected."), sourceLineKeys: [] }]
         }
 
         const palette = getPierrePalette(this.theme)
@@ -336,13 +340,12 @@ class PermissionReviewDialog implements Component {
             highlighted: preview.highlighted[appearance],
             palette,
             width,
-            wrap: this.fullscreen,
         })
     }
 
-    private renderSplitDiff(preview: PermissionDiffPreview, width: number): string[] {
+    private renderSplitDiff(preview: PermissionDiffPreview, width: number): PreviewDisplayLine[] {
         if (preview.addedLines === 0 && preview.removedLines === 0) {
-            return [this.theme.fg("muted", "No textual changes detected.")]
+            return [{ text: this.theme.fg("muted", "No textual changes detected."), sourceLineKeys: [] }]
         }
 
         const palette = getPierrePalette(this.theme)
@@ -356,7 +359,7 @@ class PermissionReviewDialog implements Component {
         })
     }
 
-    private renderNewFile(preview: PermissionNewFilePreview, width: number): string[] {
+    private renderNewFile(preview: PermissionNewFilePreview, width: number): PreviewDisplayLine[] {
         const language = getLanguageFromPath(preview.path)
         const rawLines = preview.content.length === 0 ? [""] : preview.content.split("\n")
         const highlighted = language ? highlightCode(preview.content, language) : undefined
@@ -364,12 +367,22 @@ class PermissionReviewDialog implements Component {
 
         return rawLines.flatMap((line: string, index: number) => {
             const content = highlighted?.[index] ?? this.theme.fg("toolOutput", line)
-            const numbered = `${this.theme.fg("muted", String(index + 1).padStart(lineNumberWidth, " "))} ${content}`
-            if (!this.fullscreen) {
-                return [truncateToWidth(numbered, width, "…", true)]
+            const lineNumberText = String(index + 1).padStart(lineNumberWidth, " ")
+            const prefixText = `${lineNumberText} `
+            const prefixWidth = visibleWidth(prefixText)
+            const contentWidth = Math.max(1, width - prefixWidth)
+            const prefix = `${this.theme.fg("muted", lineNumberText)} `
+            const continuationPrefix = `${this.theme.fg("muted", " ".repeat(lineNumberWidth))} `
+            const wrapped = wrapTextWithAnsi(content, contentWidth)
+
+            if (wrapped.length === 0) {
+                return [{ text: prefix, sourceLineKeys: [`new-file:${index}`] }]
             }
-            const wrapped = wrapTextWithAnsi(numbered, width)
-            return wrapped.length > 0 ? wrapped : [""]
+
+            return wrapped.map((segment, wrappedIndex) => ({
+                text: `${wrappedIndex === 0 ? prefix : continuationPrefix}${segment}`,
+                sourceLineKeys: [`new-file:${index}`],
+            }))
         })
     }
 
@@ -415,6 +428,18 @@ class PermissionReviewDialog implements Component {
         const padding = Math.max(0, width - visibleWidth(truncated))
         return `${prefix}${truncated}${" ".repeat(padding)}`
     }
+}
+
+function countSourceLines(lines: PreviewDisplayLine[]): number {
+    const sourceLineKeys = new Set<string>()
+
+    for (const line of lines) {
+        for (const sourceLineKey of line.sourceLineKeys) {
+            sourceLineKeys.add(sourceLineKey)
+        }
+    }
+
+    return sourceLineKeys.size
 }
 
 function getOverlayOptions(state: PermissionReviewDialogState, columns: number, rows: number): OverlayOptions {

@@ -71,6 +71,7 @@ import {
     buildWritePermissionPreview,
     type PermissionEditPreviewInput,
     type PermissionWritePreviewInput,
+    type PermissionReviewPreview,
 } from "./review-preview.js"
 
 const EXTENSION = "permission"
@@ -159,12 +160,21 @@ export default function (pi: ExtensionAPI) {
                 }
 
                 while (true) {
-                    const choice = await promptForPermission(
+                    const promptResult = await promptForPermission(
                         event.toolName,
                         event.input as Record<string, unknown>,
                         argValue,
                         ctx,
                     )
+
+                    if (isAutomaticFeedbackRejection(promptResult)) {
+                        return {
+                            block: true,
+                            reason: promptResult.reason,
+                        }
+                    }
+
+                    const choice = promptResult
 
                     if (choice === PERMISSION_PROMPT_ALLOW_ONCE) {
                         return undefined
@@ -468,20 +478,27 @@ async function resolveMode(
     return worst
 }
 
+type PermissionPromptResult = PermissionPromptChoice | undefined | AutomaticFeedbackRejection
+
+type AutomaticFeedbackRejection = {
+    kind: "automatic-feedback-rejection"
+    reason: string
+}
+
 async function promptForPermission(
     toolName: string,
     input: Record<string, unknown>,
     argValue: string | undefined,
     ctx: ExtensionContext,
-): Promise<PermissionPromptChoice | undefined> {
+): Promise<PermissionPromptResult> {
     if (toolName === "edit") {
         const preview = await buildEditPermissionPreview(asEditToolInput(input), ctx.cwd)
-        return showPermissionReviewDialog(ctx, preview)
+        return asPromptResult(preview) ?? showPermissionReviewDialog(ctx, preview)
     }
 
     if (toolName === "write") {
         const preview = await buildWritePermissionPreview(asWriteToolInput(input), ctx.cwd)
-        return showPermissionReviewDialog(ctx, preview)
+        return asPromptResult(preview) ?? showPermissionReviewDialog(ctx, preview)
     }
 
     const title = buildPromptTitle(toolName, input, argValue)
@@ -570,6 +587,19 @@ function asWriteToolInput(input: Record<string, unknown>): PermissionWritePrevie
         path: typeof input.path === "string" ? input.path : "",
         content: typeof input.content === "string" ? input.content : "",
     }
+}
+
+function asPromptResult(preview: PermissionReviewPreview): AutomaticFeedbackRejection | undefined {
+    if (preview.kind !== "error") return undefined
+
+    return {
+        kind: "automatic-feedback-rejection",
+        reason: preview.error,
+    }
+}
+
+function isAutomaticFeedbackRejection(value: PermissionPromptResult): value is AutomaticFeedbackRejection {
+    return typeof value === "object" && value !== null && value.kind === "automatic-feedback-rejection"
 }
 
 function isPermissionPromptChoice(value: string | undefined): value is PermissionPromptChoice {
