@@ -336,7 +336,6 @@ class PermissionReviewDialog implements Component {
             highlighted: preview.highlighted[appearance],
             palette,
             width,
-            wrap: this.fullscreen,
         })
     }
 
@@ -365,9 +364,6 @@ class PermissionReviewDialog implements Component {
         return rawLines.flatMap((line: string, index: number) => {
             const content = highlighted?.[index] ?? this.theme.fg("toolOutput", line)
             const numbered = `${this.theme.fg("muted", String(index + 1).padStart(lineNumberWidth, " "))} ${content}`
-            if (!this.fullscreen) {
-                return [truncateToWidth(numbered, width, "…", true)]
-            }
             const wrapped = wrapTextWithAnsi(numbered, width)
             return wrapped.length > 0 ? wrapped : [""]
         })

@@ -31,18 +31,16 @@ export function renderUnifiedDiffLines({
     highlighted,
     palette,
     width,
-    wrap,
 }: {
     metadata: FileDiffMetadata
     highlighted: HighlightedDiffCode
     palette: PierreTerminalPalette
     width: number
-    wrap: boolean
 }): string[] {
     const rows = buildUnifiedRows(metadata, highlighted, palette)
     const lineNumberWidth = lineNumberWidthFor(metadata)
 
-    return rows.flatMap((row) => renderUnifiedRow(row, width, wrap, lineNumberWidth, palette))
+    return rows.flatMap((row) => renderUnifiedRow(row, width, lineNumberWidth, palette))
 }
 
 export function renderSplitDiffLines({
@@ -69,25 +67,25 @@ export function renderSplitDiffLines({
 
     for (const row of rows) {
         if (row.kind !== "line") {
-            const left = renderContentCell(
-                ` ${row.text}`,
-                columnWidth,
-                { fg: palette.metadataFg, bg: palette.metadataBg },
-                false,
-            )[0]
-            const right = renderContentCell(
-                ` ${row.text}`,
-                columnWidth,
-                { fg: palette.metadataFg, bg: palette.metadataBg },
-                false,
-            )[0]
-            lines.push(`${left}${separator}${right}`)
+            const metadataStyle = { fg: palette.metadataFg, bg: palette.metadataBg }
+            const cells = renderContentCell(` ${row.text}`, columnWidth, metadataStyle, true)
+            for (const cell of cells) {
+                lines.push(`${cell}${separator}${cell}`)
+            }
             continue
         }
 
-        const left = renderSplitCell(row.left, columnWidth, lineNumberWidth, palette)
-        const right = renderSplitCell(row.right, columnWidth, lineNumberWidth, palette)
-        lines.push(`${left}${separator}${right}`)
+        const leftCells = renderSplitCell(row.left, columnWidth, lineNumberWidth, palette)
+        const rightCells = renderSplitCell(row.right, columnWidth, lineNumberWidth, palette)
+        const leftStyle = getLineStyle(row.left.lineType === "empty" ? "context" : row.left.lineType, palette)
+        const rightStyle = getLineStyle(row.right.lineType === "empty" ? "context" : row.right.lineType, palette)
+        const rowHeight = Math.max(leftCells.length, rightCells.length)
+
+        for (let index = 0; index < rowHeight; index += 1) {
+            const left = leftCells[index] ?? padRenderedLine("", columnWidth, leftStyle)
+            const right = rightCells[index] ?? padRenderedLine("", columnWidth, rightStyle)
+            lines.push(`${left}${separator}${right}`)
+        }
     }
 
     return lines
@@ -302,12 +300,11 @@ function buildSplitRows(
 function renderUnifiedRow(
     row: UnifiedDiffRow,
     width: number,
-    wrap: boolean,
     lineNumberWidth: number,
     palette: PierreTerminalPalette,
 ): string[] {
     if (row.kind !== "line") {
-        return renderContentCell(` ${row.text}`, width, { fg: palette.metadataFg, bg: palette.metadataBg }, wrap)
+        return renderContentCell(` ${row.text}`, width, { fg: palette.metadataFg, bg: palette.metadataBg }, true)
     }
 
     const style = getLineStyle(row.lineType, palette)
@@ -330,12 +327,6 @@ function renderUnifiedRow(
     )
 
     const content = renderSegments(row.spans.length > 0 ? row.spans : [{ text: " " }], { fg: style.fg, bg: style.bg })
-
-    if (!wrap) {
-        const contentLine = truncateToWidth(content, contentWidth, "…", true)
-        return [padRenderedLine(`${prefix}${contentLine}`, width, style)]
-    }
-
     const wrapped = wrapTextWithAnsi(content, contentWidth)
     if (wrapped.length === 0) {
         return [padRenderedLine(`${prefix}`, width, style)]
@@ -351,11 +342,11 @@ function renderSplitCell(
     width: number,
     lineNumberWidth: number,
     palette: PierreTerminalPalette,
-): string {
+): string[] {
     const style = getLineStyle(cell.lineType === "empty" ? "context" : cell.lineType, palette)
 
     if (cell.lineType === "empty") {
-        return renderContentCell("", width, style, false)[0]
+        return [padRenderedLine("", width, style)]
     }
 
     const prefixText = `${lineMarker(cell.lineType)}${formatLineNumber(cell.lineNumber, lineNumberWidth)} `
@@ -371,9 +362,20 @@ function renderSplitCell(
         { fg: style.fg, bg: style.bg },
     )
 
+    const continuationPrefix = renderSegments(
+        [{ text: " ".repeat(prefixWidth), fg: style.fg, bg: style.bg }],
+        { fg: style.fg, bg: style.bg },
+    )
+
     const content = renderSegments(cell.spans.length > 0 ? cell.spans : [{ text: " " }], { fg: style.fg, bg: style.bg })
-    const truncatedContent = truncateToWidth(content, contentWidth, "…", true)
-    return padRenderedLine(`${prefix}${truncatedContent}`, width, style)
+    const wrapped = wrapTextWithAnsi(content, contentWidth)
+    if (wrapped.length === 0) {
+        return [padRenderedLine(`${prefix}`, width, style)]
+    }
+
+    return wrapped.map((segment, index) =>
+        padRenderedLine(`${index === 0 ? prefix : continuationPrefix}${segment}`, width, style),
+    )
 }
 
 function renderSplitHeader(columnWidth: number, separator: string, palette: PierreTerminalPalette): string {
