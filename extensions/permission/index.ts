@@ -55,16 +55,10 @@ import {
     type PermissionPromptChoice,
     type SessionApprovalConfirmChoice,
 } from "./constants.js"
-import type {
-    DerivedSkillAllowState,
-    Mode,
-    ParsedRule,
-    PermissionSettings,
-    RuntimeSessionState,
-} from "./models.js"
+import type { DerivedSkillAllowState, Mode, ParsedRule, PermissionSettings, RuntimeSessionState } from "./models.js"
 import { BashArity } from "./bash-arity.js"
 import { extractBashCommands } from "./bash-parser.js"
-import { resolvePermissionRejection } from "./rejection.js"
+import { buildHardRejectedReason, resolvePermissionRejection } from "./rejection.js"
 import { showPermissionReviewDialog } from "./review-dialog.js"
 import {
     buildEditPermissionPreview,
@@ -171,6 +165,17 @@ export default function (pi: ExtensionAPI) {
                         return {
                             block: true,
                             reason: promptResult.reason,
+                        }
+                    }
+
+                    // Esc/Ctrl+C at the permission prompt cancels the tool call.
+                    // Without this, undefined would be treated as "back" by
+                    // resolvePermissionRejection and reopen the prompt in a loop.
+                    if (promptResult === undefined) {
+                        ctx.abort()
+                        return {
+                            block: true,
+                            reason: buildHardRejectedReason(event.toolName, argValue),
                         }
                     }
 

@@ -50,7 +50,7 @@ export async function resolvePermissionRejection(
     }
 }
 
-function buildHardRejectedReason(toolName: string, argValue: string | undefined): string {
+export function buildHardRejectedReason(toolName: string, argValue: string | undefined): string {
     if (argValue) {
         return `${STATUS_REJECTED} User rejected ${toolName}: ${argValue}`
     }
