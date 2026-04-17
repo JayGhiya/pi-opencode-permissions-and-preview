@@ -150,6 +150,7 @@ Examples:
 - `npm run dev` → `bash(npm run dev *)`
 - `uv run pytest` → `bash(uv *)`
 - `cd foo & uv run pytest` → only `uv run pytest` contributes, so session approval becomes `bash(uv *)`
+- multiline commands still match wildcard rules, so approving `bash(uv *)` also covers `uv run python -c "...\n..."`
 
 This avoids many false matches that happen with naive shell splitting.
 
