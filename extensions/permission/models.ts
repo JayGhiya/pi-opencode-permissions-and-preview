@@ -2,6 +2,7 @@ export type Mode = "allow" | "ask" | "deny"
 
 export interface PermissionSettings {
     defaultMode?: Mode
+    always?: string[]
     allow?: string[]
     deny?: string[]
     ask?: string[]

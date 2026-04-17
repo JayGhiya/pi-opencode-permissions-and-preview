@@ -1,13 +1,13 @@
 # Permission Extension
 
-A Pi extension for controlling tool execution with configurable `allow`, `deny`, and `ask` rules.
+A Pi extension for controlling tool execution with configurable `always`, `allow`, `deny`, and `ask` rules.
 
 It adds a permission layer in front of tool calls such as `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`, and `fetch`, and gives you a better review experience for file edits before they run.
 
 ## What it does
 
 - blocks, allows, or prompts for tool calls using simple rules
-- supports one-off approval or session-only approval
+- supports one-off approval, session-only approval, or persisted cross-session approval
 - adds a richer review UI for `edit` and `write`
 - previews overwrites and new files before execution
 - parses bash with Tree-sitter so permission checks work on extracted shell commands instead of naive string splitting
@@ -28,15 +28,18 @@ pi install git:github.com/JayGhiya/pi-opencode-permissions-and-preview
 The extension evaluates tool calls in this order:
 
 ```text
-deny > session approvals > ask > allow > defaultMode
+deny > persisted approvals > session approvals > ask > allow > defaultMode
 ```
 
 When a tool call resolves to `ask`, Pi shows one of these outcomes:
 
 - **Allow once**
+- **Allow always**
 - **Allow always for this session**
 - **Reject**
 - **Reject with feedback**
+
+`Allow always` saves approval rules into `<repo-root>/.agents/permission.settings.json` under `always`, so they work across sessions for that project. The extension re-reads permission rules on each tool call, so this does not require a reload.
 
 Session approvals are in-memory only and scoped to the current Pi session.
 
@@ -57,6 +60,7 @@ Pi loads and merges 3 tiers:
 ```json
 {
   "defaultMode": "ask",
+  "always": ["bash(git checkout *)"],
   "allow": ["read", "bash(git status *)"],
   "deny": ["bash(rm -rf *)"],
   "ask": ["edit", "write", "bash(npm publish *)"],
@@ -93,7 +97,7 @@ By default, the permission prompt shows a compact preview:
 - Pierre-style stacked (unified) diff rows for `edit` and overwrite `write`
 - syntax-aware highlighting derived from `@pierre/diffs` metadata + highlighter output
 - concise new-file summary for brand-new writes
-- the same 4 permission outcomes as every other ask flow
+- the same 5 permission outcomes as every other ask flow
 
 ### Full review
 
@@ -142,14 +146,14 @@ The extension:
 2. walks extracted AST `command` nodes
 3. skips cwd-only commands like `cd`
 4. evaluates permission rules against the extracted commands
-5. derives session approval patterns from command tokens
+5. derives persistent and session approval patterns from command tokens
 
 Examples:
 
 - `git checkout main` → `bash(git checkout *)`
 - `npm run dev` → `bash(npm run dev *)`
 - `uv run pytest` → `bash(uv *)`
-- `cd foo & uv run pytest` → only `uv run pytest` contributes, so session approval becomes `bash(uv *)`
+- `cd foo & uv run pytest` → only `uv run pytest` contributes, so approval becomes `bash(uv *)`
 - multiline commands still match wildcard rules, so approving `bash(uv *)` also covers `uv run python -c "...\n..."`
 
 This avoids many false matches that happen with naive shell splitting.
@@ -179,7 +183,7 @@ These do **not** bypass permission entirely. They just add more allow rules for 
 
 Use `/permission-settings` to inspect:
 
-- merged persisted settings
+- merged persisted settings, including `always`
 - effective settings including session approvals
 - skill-derived allow rules and their sources
 - session-approved runtime rules
