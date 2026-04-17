@@ -17,7 +17,7 @@ The `permission` extension adds a configurable permission layer on top of Pi too
 ### Brief functionality
 
 - `allow` / `deny` / `ask` rules for tool calls
-- session-only approvals
+- session-only and persisted approvals
 - AST-aware bash permission matching
 - custom preview and review UI for `edit` and `write`
 - pierre diff preview for overwrites and edits

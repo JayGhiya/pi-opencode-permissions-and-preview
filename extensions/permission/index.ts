@@ -9,6 +9,7 @@
  * Schema:
  * {
  *   "defaultMode": "ask" | "allow" | "deny",
+ *   "always": ["toolPattern", "tool(argPattern)", ...],
  *   "allow": ["toolPattern", "tool(argPattern)", ...],
  *   "deny":  ["toolPattern", "tool(argPattern)", ...],
  *   "ask":   ["toolPattern", "tool(argPattern)", ...]
@@ -23,7 +24,7 @@
  *   "bash(git *)"         — match tool "bash" where command matches "git *"
  *   "edit(/tmp/*)"        — match tool "edit" where path matches "/tmp/*"
  *
- * Evaluation order: deny > session approvals > ask > allow > defaultMode (default: "ask")
+ * Evaluation order: deny > persisted approvals > session approvals > ask > allow > defaultMode (default: "ask")
  *
  * Argument matching depends on the tool:
  *   bash  — matched against AST-extracted command text
@@ -32,6 +33,8 @@
  */
 
 import * as fs from "node:fs"
+import * as fsp from "node:fs/promises"
+import type { FileHandle } from "node:fs/promises"
 
 import {
     parseFrontmatter,
@@ -42,18 +45,18 @@ import {
 
 import * as project from "../__lib/project.js"
 import {
+    APPROVAL_CONFIRM_APPROVE,
+    APPROVAL_CONFIRM_BACK,
+    APPROVAL_CONFIRM_CHOICES,
+    APPROVAL_CONFIRM_REJECT,
     PERMISSION_CHOICES,
+    PERMISSION_PROMPT_ALLOW_ALWAYS,
     PERMISSION_PROMPT_ALLOW_ALWAYS_FOR_SESSION,
     PERMISSION_PROMPT_ALLOW_ONCE,
     PERMISSION_PROMPT_REJECT,
     PERMISSION_PROMPT_REJECT_WITH_FEEDBACK,
-    SESSION_APPROVAL_CONFIRM_APPROVE,
-    SESSION_APPROVAL_CONFIRM_BACK,
-    SESSION_APPROVAL_CONFIRM_CHOICES,
-    SESSION_APPROVAL_CONFIRM_REJECT,
     STATUS_REJECTED,
     type PermissionPromptChoice,
-    type SessionApprovalConfirmChoice,
 } from "./constants.js"
 import type { DerivedSkillAllowState, Mode, ParsedRule, PermissionSettings, RuntimeSessionState } from "./models.js"
 import { BashArity } from "./bash-arity.js"
@@ -69,6 +72,9 @@ import {
 } from "./review-preview.js"
 
 const EXTENSION = "permission"
+const PERSISTENT_APPROVAL_LOCK_RETRY_MS = 50
+const PERSISTENT_APPROVAL_LOCK_TIMEOUT_MS = 5_000
+const PERSISTENT_APPROVAL_LOCK_STALE_MS = 30_000
 
 // Runtime session state keyed by the active PI session id.
 const SessionStates = new Map<string, RuntimeSessionState>()
@@ -185,9 +191,60 @@ export default function (pi: ExtensionAPI) {
                         return undefined
                     }
 
+                    if (choice === PERMISSION_PROMPT_ALLOW_ALWAYS) {
+                        const alwaysRules = await getApprovalRules(event.toolName, argValue)
+                        const settingsPath = getPersistentApprovalSettingsPath(ctx.cwd)
+                        const confirmation = await confirmApprovalRules(ctx, event.toolName, alwaysRules, {
+                            scope: "persistent",
+                            settingsPath,
+                        })
+
+                        if (confirmation === "approved") {
+                            try {
+                                const result = await persistApprovalRules(ctx.cwd, alwaysRules)
+                                const action = result.added.length === 0 ? "Already saved" : "Saved"
+                                ctx.ui.notify(
+                                    `${action} persistent approval rule${alwaysRules.length === 1 ? "" : "s"} in ${result.settingsPath}: ${alwaysRules.join(", ")}`,
+                                    "info",
+                                )
+                                ctx.ui.notify(
+                                    "No reload needed for permission rules — they are re-read on the next tool call.",
+                                    "info",
+                                )
+                                return undefined
+                            } catch (error) {
+                                ctx.ui.notify(getPersistentApprovalErrorMessage(error), "error")
+                                continue
+                            }
+                        }
+
+                        if (confirmation === "back") {
+                            continue
+                        }
+
+                        if (confirmation === "reject") {
+                            const rejection = await resolvePermissionRejection(
+                                ctx,
+                                PERMISSION_PROMPT_REJECT,
+                                event.toolName,
+                                argValue,
+                            )
+                            if (rejection.kind === "back") {
+                                continue
+                            }
+                            ctx.abort()
+                            return {
+                                block: true,
+                                reason: rejection.reason,
+                            }
+                        }
+                    }
+
                     if (choice === PERMISSION_PROMPT_ALLOW_ALWAYS_FOR_SESSION) {
-                        const sessionRules = await getSessionApprovalRules(event.toolName, argValue)
-                        const confirmation = await confirmSessionApprovalRules(ctx, event.toolName, sessionRules)
+                        const sessionRules = await getApprovalRules(event.toolName, argValue)
+                        const confirmation = await confirmApprovalRules(ctx, event.toolName, sessionRules, {
+                            scope: "session",
+                        })
 
                         if (confirmation === "approved") {
                             for (const rule of sessionRules) {
@@ -245,6 +302,7 @@ function mergePermissions(
 ): Partial<PermissionSettings> {
     return {
         defaultMode: override.defaultMode ?? base.defaultMode,
+        always: [...(base.always ?? []), ...(override.always ?? [])],
         allow: [...(base.allow ?? []), ...(override.allow ?? [])],
         deny: [...(base.deny ?? []), ...(override.deny ?? [])],
         ask: [...(base.ask ?? []), ...(override.ask ?? [])],
@@ -389,7 +447,7 @@ function mergeSessionApprovalRules(settings: PermissionSettings, sessionRules: s
 
     return {
         ...settings,
-        allow: [...new Set([...(settings.allow ?? []), ...sessionRules])],
+        always: [...new Set([...(settings.always ?? []), ...sessionRules])],
     }
 }
 
@@ -451,6 +509,7 @@ function resolveSingleMode(
     if (override) return override
 
     if (matchesAnyRule(settings.deny ?? [], toolName, argValue)) return "deny"
+    if (matchesAnyRule(settings.always ?? [], toolName, argValue)) return "allow"
     if (matchesAnyRule(Array.from(sessionState.approvalRules), toolName, argValue)) return "allow"
     if (matchesAnyRule(settings.ask ?? [], toolName, argValue)) return "ask"
     if (matchesAnyRule(settings.allow ?? [], toolName, argValue)) return "allow"
@@ -516,26 +575,42 @@ async function promptForPermission(
     return isPermissionPromptChoice(choice) ? choice : undefined
 }
 
-async function confirmSessionApprovalRules(
+type ConfirmApprovalRulesOptions =
+    | {
+          scope: "persistent"
+          settingsPath: string
+      }
+    | {
+          scope: "session"
+      }
+
+async function confirmApprovalRules(
     ctx: ExtensionContext,
     toolName: string,
     rules: string[],
+    options: ConfirmApprovalRulesOptions,
 ): Promise<"approved" | "back" | "reject"> {
     if (rules.length === 0) {
-        ctx.ui.notify(`Could not derive a session approval rule for ${toolName}`, "error")
+        const scopeLabel = options.scope === "persistent" ? "persistent" : "session"
+        ctx.ui.notify(`Could not derive a ${scopeLabel} approval rule for ${toolName}`, "error")
         return "back"
     }
 
     const suffix = rules.length === 1 ? "rule" : "rules"
-    const message = `Allow always for this session will add the following ${suffix}:\n\n${rules
-        .map((rule) => `- ${rule}`)
-        .join("\n")}`
+    const message =
+        options.scope === "persistent"
+            ? `Allow always will save the following ${suffix} to:\n\n${options.settingsPath}\n\n${rules
+                  .map((rule) => `- ${rule}`)
+                  .join("\n")}`
+            : `Allow always for this session will add the following ${suffix}:\n\n${rules
+                  .map((rule) => `- ${rule}`)
+                  .join("\n")}`
 
-    const choice = await ctx.ui.select(message, [...SESSION_APPROVAL_CONFIRM_CHOICES])
-    if (choice === SESSION_APPROVAL_CONFIRM_APPROVE) return "approved"
-    if (choice === SESSION_APPROVAL_CONFIRM_BACK) return "back"
-    if (choice === SESSION_APPROVAL_CONFIRM_REJECT) return "reject"
-    return "reject"
+    const choice = await ctx.ui.select(message, [...APPROVAL_CONFIRM_CHOICES])
+    if (choice === APPROVAL_CONFIRM_APPROVE) return "approved"
+    if (choice === APPROVAL_CONFIRM_REJECT) return "reject"
+    if (choice === APPROVAL_CONFIRM_BACK) return "back"
+    return "back"
 }
 
 function buildPromptTitle(toolName: string, input: Record<string, unknown>, argValue: string | undefined): string {
@@ -543,7 +618,7 @@ function buildPromptTitle(toolName: string, input: Record<string, unknown>, argV
     return `${toolName}\n\n${details}\n\nChoose permission:`
 }
 
-async function getSessionApprovalRules(toolName: string, argValue: string | undefined): Promise<string[]> {
+async function getApprovalRules(toolName: string, argValue: string | undefined): Promise<string[]> {
     switch (toolName) {
         case "bash": {
             if (!argValue) return []
@@ -567,6 +642,146 @@ async function getSessionApprovalRules(toolName: string, argValue: string | unde
         default:
             return [toolName]
     }
+}
+
+function getPersistentApprovalSettingsPath(cwd: string): string {
+    return project.getExtensionSettingsPaths(EXTENSION, cwd).project
+}
+
+type PersistApprovalRulesResult = {
+    settingsPath: string
+    added: string[]
+}
+
+async function persistApprovalRules(cwd: string, rules: string[]): Promise<PersistApprovalRulesResult> {
+    const settingsPath = getPersistentApprovalSettingsPath(cwd)
+    await fsp.mkdir(project.resolveProjectAgentsDir(cwd), { recursive: true })
+
+    return withPersistentApprovalLock(settingsPath, async () => {
+        const existing = await loadOwnSettingsFile(settingsPath)
+        const currentAlways = parseRuleList(existing.always)
+        const nextAlways = [...new Set([...currentAlways, ...rules])]
+        const added = rules.filter((rule) => !currentAlways.includes(rule))
+        const nextSettings: PermissionSettings = {
+            ...existing,
+            always: nextAlways,
+        }
+
+        await writeOwnSettingsFileAtomic(settingsPath, nextSettings)
+
+        return {
+            settingsPath,
+            added,
+        }
+    })
+}
+
+async function withPersistentApprovalLock<T>(settingsPath: string, action: () => Promise<T> | T): Promise<T> {
+    const lockPath = `${settingsPath}.lock`
+    const start = Date.now()
+
+    while (true) {
+        let lockHandle: FileHandle | undefined
+
+        try {
+            lockHandle = await fsp.open(lockPath, "wx")
+            return await action()
+        } catch (error) {
+            if (!isErrnoCode(error, "EEXIST")) {
+                throw error
+            }
+
+            if (await isStalePersistentApprovalLock(lockPath)) {
+                try {
+                    await fsp.unlink(lockPath)
+                    continue
+                } catch (unlinkError) {
+                    if (!isErrnoCode(unlinkError, "ENOENT")) {
+                        throw unlinkError
+                    }
+                }
+            }
+
+            if (Date.now() - start >= PERSISTENT_APPROVAL_LOCK_TIMEOUT_MS) {
+                throw new Error(`Timed out waiting to update ${settingsPath} because another approval save is still in progress`)
+            }
+
+            await delay(PERSISTENT_APPROVAL_LOCK_RETRY_MS)
+        } finally {
+            if (lockHandle) {
+                await lockHandle.close()
+                try {
+                    await fsp.unlink(lockPath)
+                } catch (unlinkError) {
+                    if (!isErrnoCode(unlinkError, "ENOENT")) {
+                        throw unlinkError
+                    }
+                }
+            }
+        }
+    }
+}
+
+async function isStalePersistentApprovalLock(lockPath: string): Promise<boolean> {
+    try {
+        return Date.now() - (await fsp.stat(lockPath)).mtimeMs >= PERSISTENT_APPROVAL_LOCK_STALE_MS
+    } catch (error) {
+        if (isErrnoCode(error, "ENOENT")) {
+            return false
+        }
+        throw error
+    }
+}
+
+async function writeOwnSettingsFileAtomic(settingsPath: string, settings: PermissionSettings): Promise<void> {
+    const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`
+
+    try {
+        await fsp.writeFile(tempPath, `${JSON.stringify(settings, null, 4)}\n`, "utf-8")
+        await fsp.rename(tempPath, settingsPath)
+    } catch (error) {
+        try {
+            await fsp.unlink(tempPath)
+        } catch (unlinkError) {
+            if (!isErrnoCode(unlinkError, "ENOENT")) {
+                throw unlinkError
+            }
+        }
+        throw error
+    }
+}
+
+function isErrnoCode(error: unknown, code: string): boolean {
+    return typeof error === "object" && error !== null && "code" in error && error.code === code
+}
+
+async function delay(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function loadOwnSettingsFile(settingsPath: string): Promise<PermissionSettings> {
+    let raw: string
+
+    try {
+        raw = await fsp.readFile(settingsPath, "utf-8")
+    } catch (error) {
+        if (isErrnoCode(error, "ENOENT")) {
+            return {}
+        }
+        throw error
+    }
+
+    try {
+        return JSON.parse(raw) as PermissionSettings
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        throw new Error(`Invalid JSON in ${settingsPath}: ${message}`)
+    }
+}
+
+function getPersistentApprovalErrorMessage(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error)
+    return `Could not save persistent approval rules: ${message}`
 }
 
 function getBashAlwaysPattern(tokens: string[]): string | undefined {
@@ -615,6 +830,7 @@ function isAutomaticFeedbackRejection(value: PermissionPromptResult): value is A
 function isPermissionPromptChoice(value: string | undefined): value is PermissionPromptChoice {
     return (
         value === PERMISSION_PROMPT_ALLOW_ONCE ||
+        value === PERMISSION_PROMPT_ALLOW_ALWAYS ||
         value === PERMISSION_PROMPT_ALLOW_ALWAYS_FOR_SESSION ||
         value === PERMISSION_PROMPT_REJECT ||
         value === PERMISSION_PROMPT_REJECT_WITH_FEEDBACK
