@@ -402,9 +402,14 @@ function parseRule(rule: string): ParsedRule {
 }
 
 function matchPattern(pattern: string, value: string): boolean {
-    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")
-    // Make trailing " .*" optional so "cmd *" also matches bare "cmd"
-    const adjusted = escaped.replace(/ \.\*$/, "( .*)?")
+    const wildcard = "__PI_PERMISSION_WILDCARD__"
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, wildcard)
+    // Make trailing " *" optional so "cmd *" also matches bare "cmd".
+    // Wildcards need to match across newlines too, otherwise multiline bash
+    // commands like `uv run python -c "...\n..."` won't match session rules.
+    const adjusted = escaped
+        .replace(new RegExp(` ${wildcard}$`), "(?: [\\s\\S]*)?")
+        .replaceAll(wildcard, "[\\s\\S]*")
     return new RegExp(`^${adjusted}$`).test(value)
 }
 
